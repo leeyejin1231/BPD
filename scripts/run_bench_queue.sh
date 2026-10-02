@@ -18,13 +18,14 @@ for job in "$@"; do
     hier)    cfg=hierarchy_r03_variant.json;;
     ours)    cfg=confpivot_v2_t075_p32_s2.json;;
     wino)    cfg=wino_${task}.json;;
+    fastdllm_*) cfg=${method}.json;;
     *)       cfg=confpivot_v2_${method}.json;;
   esac
   out=results/${task}_g${gen}_b32_${method}; extra=""
   if [ -n "$shard" ]; then out=${out}_shard${shard/\//-}; extra="--shard $shard"; fi
   echo "=== $(date) START $job -> $out" >> logs/bench_queue_gpu${gpu}.log
   CUDA_VISIBLE_DEVICES=$gpu $PY -u eval_bench.py --task $task --model $MODEL --dataset $data \
-    --output $out --gen-length $gen --block-length 32 --steps $gen $extra --variant-config $cfg \
+    --output $out --gen-length $gen --block-length 32 --steps $gen $extra --variant-config configs/$cfg \
     > logs/bench_${task}_${method}${shard:+_shard${shard/\//-}}.out 2>&1
   echo "=== $(date) END $job exit=$?" >> logs/bench_queue_gpu${gpu}.log
 done

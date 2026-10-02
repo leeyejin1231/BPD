@@ -36,6 +36,7 @@ from hierarchy_decode import generate_hierarchy
 from decode_confidence import generate as generate_confidence_pivot
 from decode_confidence_v2 import generate as generate_confidence_pivot_v2
 from wino_decode import generate as generate_wino, load_model as load_wino_model
+from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
 from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
 
 
@@ -180,6 +181,7 @@ def main():
         'decode_confidence_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence.py').read_bytes()).hexdigest(),
         'decode_confidence_v2_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v2.py').read_bytes()).hexdigest(),
         'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
+        'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
         'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'metrics': {
             'accuracy': 'Last #### numeric answer, falling back to last number; numeric equality.',
@@ -197,7 +199,7 @@ def main():
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence.py', 'decode_confidence_v2.py', 'wino_decode.py', 'eval_gsm8k.py'):
+    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence.py', 'decode_confidence_v2.py', 'wino_decode.py', 'fastdllm_decode.py', 'eval_gsm8k.py'):
         (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
     write_json(out_dir / 'samples.json', [{'test_index': i, **dataset[i]} for i in indices])
     records_path = out_dir / 'results.jsonl'
@@ -209,12 +211,17 @@ def main():
     print(f'Loading {args.model} on {config["gpu"]}', flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
     uses_wino = any(v['remasking'] == 'wino' for v in variants.values())
+    uses_fastdllm = any(v['remasking'] == 'fastdllm' or v.get('prefix_cache') for v in variants.values())
+    if uses_fastdllm and (uses_wino or args.model_family == 'dream'):
+        raise ValueError('fastdllm needs its own LLaDA modeling: run it alone, on --model-family llada.')
     if args.model_family == 'dream':
         model = load_dream_model(args.model)
         mask_id, end_ids = DREAM_MASK_ID, set(DREAM_END_IDS)
     else:
         if uses_wino:
             model = load_wino_model(args.model)
+        elif uses_fastdllm:
+            model = load_fastdllm_model(args.model)
         else:
             model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
                                             local_files_only=True, torch_dtype=torch.bfloat16).to('cuda').eval()
@@ -235,7 +242,8 @@ def main():
         decoder = {'hierarchy': generate_hierarchy,
                    'confidence_pivot': generate_confidence_pivot,
                    'confidence_pivot_v2': generate_confidence_pivot_v2,
-                   'wino': generate_wino}.get(remasking, generate)
+                   'wino': generate_wino,
+                   'fastdllm': generate_fastdllm}.get(remasking, generate)
         target = model
         if decoder is generate_wino and args.model_family == 'dream':
             target, kwargs['dream'] = model.model, True  # raw Dream model; shadow-slot shift handled inside

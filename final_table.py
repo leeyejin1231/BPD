@@ -1,4 +1,4 @@
-"""Final per-benchmark table: vanilla / Hierarchy-dLLM / WINO / ours, with McNemar vs ours.
+"""Final per-benchmark table: vanilla / Hierarchy-dLLM / WINO / Fast-dLLM (LLaDA only) / ours, with McNemar vs ours.
 
 Usage: python final_table.py [--family llada|dream] [--markdown]
 Metrics: performance (accuracy, pass@1, or IFEval prompt-level strict accuracy),
@@ -16,21 +16,24 @@ TOTAL = {'gsm8k': 1319, 'humaneval': 164, 'math500': 500, 'mbpp': 500, 'ifeval':
 SUCCESS = {'gsm8k': lambda r: r['correct'], 'humaneval': lambda r: r['passed'],
            'math500': lambda r: r['correct'], 'mbpp': lambda r: r['passed'],
            'ifeval': lambda r: r['ifeval']['prompt_strict']}
-NAMES = {'vanilla': 'Vanilla', 'hier': 'Hierarchy-dLLM', 'wino': 'WINO', 'ours': 'Ours'}
+NAMES = {'vanilla': 'Vanilla', 'hier': 'Hierarchy-dLLM', 'wino': 'WINO',
+         'fastdllm_parallel': 'Fast-dLLM (parallel)', 'fastdllm_dual': 'Fast-dLLM (parallel + dual cache)',
+         'ours': 'Ours'}
 
+FAST = {'fastdllm_parallel': 'fastdllm_parallel', 'fastdllm_dual': 'fastdllm_dual'}
 # family -> task -> (directory pattern with {cfg}, {method: cfg})
 FAMILY = {
     'llada': {
         'gsm8k': ('results/gsm8k_full_g128_b32_{cfg}',
-                  {'vanilla': 'vanilla_s128', 'hier': 'hier_r03', 'wino': 'wino', 'ours': 't075_p32_s2'}),
+                  {'vanilla': 'vanilla_s128', 'hier': 'hier_r03', 'wino': 'wino', **FAST, 'ours': 't075_p32_s2'}),
         'humaneval': ('results/humaneval_g256_b32_{cfg}',
-                      {'vanilla': 'vanilla_s256', 'hier': 'hier_r03', 'wino': 'wino', 'ours': 't075_p32_s2'}),
+                      {'vanilla': 'vanilla_s256', 'hier': 'hier_r03', 'wino': 'wino', **FAST, 'ours': 't075_p32_s2'}),
         'math500': ('results/math500_g256_b32_{cfg}',
-                    {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', 'ours': 'ours'}),
+                    {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', **FAST, 'ours': 'ours'}),
         'mbpp': ('results/mbpp_g256_b32_{cfg}',
-                 {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', 'ours': 'ours'}),
+                 {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', **FAST, 'ours': 'ours'}),
         'ifeval': ('results/ifeval_g512_b32_{cfg}',
-                   {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', 'ours': 'ours'}),
+                   {'vanilla': 'vanilla', 'hier': 'hier', 'wino': 'wino', **FAST, 'ours': 'ours'}),
     },
     'dream': {task: (f'results/dream_{task}_g{gen}_b32_{{cfg}}',
                      {m: m for m in ('vanilla', 'hier', 'wino', 'ours')})

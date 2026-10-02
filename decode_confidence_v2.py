@@ -9,7 +9,20 @@ Example (model and prompt already loaded):
     from decode_confidence_v2 import generate
     output, stats = generate(
         model, prompt, gen_length=256, block_length=32,
-        confidence_threshold=0.8, small_interval_size=2, return_stats=True,
+        confidence_threshold=0.75, small_interval_size=2, pivots_per_interval=32,
+        return_stats=True,
+    )
+    # Dynamic p: the pivot budget depends on the interval size.
+    output, stats = generate(
+        model, prompt, gen_length=256, block_length=32,
+        confidence_threshold=0.75, small_interval_size=2,
+        pivot_schedule=[[16, 32], [8, 16], [4, 4], [2, 2]], return_stats=True,
+    )
+    # Dynamic threshold: tau(A) = 0.75 + (0.85 - 0.75) * |A| / block_length.
+    output, stats = generate(
+        model, prompt, gen_length=256, block_length=32,
+        confidence_threshold=0.75, confidence_threshold_max=0.85,
+        small_interval_size=2, pivots_per_interval=32, return_stats=True,
     )
 
 This module does not load models or start experiments when imported or executed.
@@ -22,18 +35,47 @@ import torch
 from decode import add_gumbel_noise
 
 
-_DIAGNOSTICS = ('candidates', 'deferred', 'fallback', 'bulk_intervals', 'bulk_tokens')
+_DIAGNOSTICS = ('candidates', 'deferred', 'fallback', 'bulk_intervals', 'bulk_tokens', 'intervals')
+
+
+def pivot_budget(interval_size, pivots_per_interval, pivot_schedule):
+    """Pivots allowed for an interval: the first [min_size, p] with size > min_size wins.
+
+    pivot_schedule is a list of [min_size, p] pairs in descending min_size order;
+    sizes at or below the last min_size use its p. None means a fixed budget.
+    """
+    if pivot_schedule is None:
+        return pivots_per_interval
+    for min_size, budget in pivot_schedule:
+        if interval_size > min_size:
+            return budget
+    return pivot_schedule[-1][1]
+
+
+def interval_threshold(interval_size, confidence_threshold, confidence_threshold_max, block_length):
+    """Confidence cutoff for an interval, linear in its size.
+
+    tau(A) = confidence_threshold + (confidence_threshold_max - confidence_threshold)
+    * |A| / block_length, so a full block uses confidence_threshold_max and the
+    cutoff relaxes towards confidence_threshold as intervals shrink. None means
+    the fixed confidence_threshold.
+    """
+    if confidence_threshold_max is None:
+        return confidence_threshold
+    return (confidence_threshold
+            + (confidence_threshold_max - confidence_threshold) * interval_size / block_length)
 
 
 def select_pivots(confidence, intervals, confidence_threshold, small_interval_size=2,
-                  pivots_per_interval=1, nonadjacent_pivots=False):
+                  pivots_per_interval=1, pivot_schedule=None,
+                  confidence_threshold_max=None, block_length=None):
     """Complete existing small intervals and select pivots per eligible large one.
 
-    Each large interval commits up to pivots_per_interval distinct positions,
+    Each large interval commits up to its pivot budget of distinct positions,
     sampled uniformly without replacement from its above-threshold candidates.
-    With nonadjacent_pivots, candidates are visited in that random order and a
-    candidate is skipped when it neighbours an already chosen pivot, so no two
-    pivots of one interval are committed side by side from the same forward.
+    The budget is pivots_per_interval, or pivot_budget(size) with pivot_schedule.
+    The cutoff is confidence_threshold, or interval_threshold(size) when
+    confidence_threshold_max is given.
 
     confidence: (batch, block_length) predicted-token probabilities.
     intervals: per-sample lists of half-open, block-relative masked intervals.
@@ -44,6 +86,8 @@ def select_pivots(confidence, intervals, confidence_threshold, small_interval_si
     nor an eligible pivot makes progress. candidates counts above-threshold
     positions in all input intervals, including those completed in bulk.
     deferred counts only intervals carried forward without any token committed.
+    intervals logs every interval that reaches the pivot rule (size >
+    small_interval_size): its size, cutoff, eligible count, budget and selected pivots.
     """
     scores = confidence.detach().cpu()
     selected = torch.zeros(scores.shape, dtype=torch.bool)
@@ -55,9 +99,12 @@ def select_pivots(confidence, intervals, confidence_threshold, small_interval_si
         completed = set()
         candidate_count = 0
         bulk_tokens = 0
+        interval_log = []
         for interval_index, (start, end) in enumerate(sample_intervals):
+            threshold = interval_threshold(end - start, confidence_threshold,
+                                           confidence_threshold_max, block_length)
             eligible = torch.nonzero(
-                scores[batch_index, start:end] >= confidence_threshold,
+                scores[batch_index, start:end] >= threshold,
                 as_tuple=True,
             )[0]
             candidate_count += eligible.numel()
@@ -65,19 +112,19 @@ def select_pivots(confidence, intervals, confidence_threshold, small_interval_si
                 selected[batch_index, start:end] = True
                 completed.add(interval_index)
                 bulk_tokens += end - start
-            elif eligible.numel():
-                count = min(pivots_per_interval, eligible.numel())
-                order = torch.randperm(eligible.numel(), device='cpu')
-                if nonadjacent_pivots:
-                    chosen = []
-                    for candidate in eligible[order].tolist():
-                        if all(abs(candidate - other) > 1 for other in chosen):
-                            chosen.append(candidate)
-                            if len(chosen) == count:
-                                break
-                else:
-                    chosen = eligible[order[:count]].tolist()
-                pivots[interval_index] = sorted(start + offset for offset in chosen)
+                continue
+            budget = pivot_budget(end - start, pivots_per_interval, pivot_schedule)
+            interval_log.append({
+                'interval_size': end - start,
+                'threshold': threshold,
+                'eligible_count': eligible.numel(),
+                'pivot_budget': budget,
+                'selected_pivots': min(budget, eligible.numel()),
+            })
+            if eligible.numel():
+                count = min(budget, eligible.numel())
+                choice = torch.randperm(eligible.numel(), device='cpu')[:count]
+                pivots[interval_index] = sorted((start + eligible[choice]).tolist())
 
         fallback = bool(sample_intervals) and not completed and not pivots
         if fallback:
@@ -116,6 +163,7 @@ def select_pivots(confidence, intervals, confidence_threshold, small_interval_si
         diagnostics['fallback'].append(int(fallback))
         diagnostics['bulk_intervals'].append(len(completed))
         diagnostics['bulk_tokens'].append(bulk_tokens)
+        diagnostics['intervals'].append(interval_log)
 
     return selected.to(confidence.device), next_intervals, diagnostics
 
@@ -125,7 +173,7 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
              block_length=32, temperature=0., cfg_scale=0., mask_id=126336,
              confidence_threshold=0.8, logits_eos_inf=False, eos_token_id=126081,
              return_stats=False, small_interval_size=2, pivots_per_interval=1,
-             nonadjacent_pivots=False):
+             pivot_schedule=None, confidence_threshold_max=None, prefix_cache=False):
     """Generate with confidence-filtered random pivots and small-interval completion.
 
     Blocks are processed sequentially while the model attends to the full
@@ -134,8 +182,8 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
         even below confidence_threshold.
       * Larger intervals commit up to pivots_per_interval uniformly sampled
         above-threshold pivots (without replacement), or wait when there is
-        no candidate. nonadjacent_pivots forbids two pivots of the same
-        interval at neighbouring positions; bulk completion is unaffected.
+        no candidate. pivot_schedule ([[min_size, p], ...], descending
+        min_size) replaces the fixed budget with one chosen by interval size.
       * Newly created children become eligible only on the next forward.
     When a sample would otherwise commit nothing, its most confident masked
     token is committed as a fallback, even below the confidence threshold.
@@ -149,6 +197,17 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
     and MASK/optional EOS suppression, before sampling noise. With temperature
     > 0, score the sampled token, not necessarily argmax.
 
+    confidence_threshold_max makes the cutoff depend on the interval size:
+    tau(A) = confidence_threshold + (confidence_threshold_max -
+    confidence_threshold) * |A| / block_length. A fresh block starts at
+    confidence_threshold_max and the cutoff relaxes as its intervals shrink.
+
+    prefix_cache uses Fast-dLLM's prefix KV cache: the first forward of a block
+    is a full forward whose keys/values for everything before the block are
+    kept; later forwards of the block recompute only the block and the suffix.
+    It needs a model that accepts past_key_values (fastdllm_decode.load_model),
+    batch size 1 and cfg_scale 0; attention_mask is not passed to the model.
+
     steps is accepted for compatibility but ignored: generation finishes when
     no masked intervals remain. Each active sample commits at least one token
     per step, so a block needs at most block_length forward calls. Previously
@@ -158,17 +217,23 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
     (forward_steps, batch_size), including zero counts for finished samples.
     bulk_intervals_per_step and bulk_tokens_per_step count intervals and tokens
     completed by the small-interval rule, regardless of their confidence.
+    intervals_per_step holds the per-interval pivot log of select_pivots.
     """
     if not 0 <= confidence_threshold <= 1:
         raise ValueError('confidence_threshold must be between 0 and 1.')
+    if confidence_threshold_max is not None and not confidence_threshold <= confidence_threshold_max <= 1:
+        raise ValueError('confidence_threshold_max must be between confidence_threshold and 1.')
     if (isinstance(small_interval_size, bool)
             or not isinstance(small_interval_size, int) or small_interval_size < 0):
         raise ValueError('small_interval_size must be a non-negative integer.')
     if (isinstance(pivots_per_interval, bool)
             or not isinstance(pivots_per_interval, int) or pivots_per_interval < 1):
         raise ValueError('pivots_per_interval must be a positive integer.')
-    if not isinstance(nonadjacent_pivots, bool):
-        raise ValueError('nonadjacent_pivots must be a bool.')
+    if pivot_schedule is not None:
+        pivot_schedule = [[int(min_size), int(budget)] for min_size, budget in pivot_schedule]
+        if (not pivot_schedule or any(b < 1 for _, b in pivot_schedule)
+                or any(a[0] <= b[0] for a, b in zip(pivot_schedule, pivot_schedule[1:]))):
+            raise ValueError('pivot_schedule needs [min_size, p>=1] pairs in descending min_size order.')
     if gen_length <= 0 or block_length <= 0 or gen_length % block_length:
         raise ValueError('Positive gen_length must be divisible by positive block_length.')
     if prompt.ndim != 2 or prompt.shape[0] == 0:
@@ -177,6 +242,8 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
         raise ValueError('attention_mask must have the same shape as prompt.')
     if temperature < 0 or cfg_scale < 0:
         raise ValueError('temperature and cfg_scale must be non-negative.')
+    if prefix_cache and (prompt.shape[0] != 1 or cfg_scale > 0):
+        raise ValueError('prefix_cache needs batch size 1 and cfg_scale 0.')
 
     base_model = getattr(model, 'module', model)
     model_name = getattr(getattr(base_model, 'config', None), '_name_or_path', '')
@@ -203,8 +270,18 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
         block_end = block_start + block_length
         intervals = [[(0, block_length)] for _ in range(batch_size)]
         block_steps = 0
+        past_key_values = None
         while any(intervals):
-            if cfg_scale > 0:
+            if prefix_cache and past_key_values is None:
+                output = model(x, use_cache=True)
+                logits = output.logits[:, block_start:block_end]
+                past_key_values = [tuple(t[:, :, :block_start] for t in layer)
+                                   for layer in output.past_key_values]
+                del output
+            elif prefix_cache:
+                logits = model(x[:, block_start:], past_key_values=past_key_values,
+                               use_cache=True).logits[:, :block_length]
+            elif cfg_scale > 0:
                 unconditioned = x.clone()
                 unconditioned[prompt_index] = mask_id
                 inputs = torch.cat([x, unconditioned], dim=0)
@@ -227,7 +304,7 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
             )
             selected, intervals, diagnostics = select_pivots(
                 confidence, intervals, confidence_threshold, small_interval_size,
-                pivots_per_interval, nonadjacent_pivots)
+                pivots_per_interval, pivot_schedule, confidence_threshold_max, block_length)
             block = x[:, block_start:block_end]
             block[selected] = predictions[selected]
             forward_steps += 1
@@ -246,9 +323,11 @@ def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
         'steps_per_block': steps_per_block,
         'unmasked_per_step': torch.stack(unmasked_per_step).cpu().tolist(),
         'confidence_threshold': confidence_threshold,
+        'confidence_threshold_max': confidence_threshold_max,
         'small_interval_size': small_interval_size,
         'pivots_per_interval': pivots_per_interval,
-        'nonadjacent_pivots': nonadjacent_pivots,
+        'pivot_schedule': pivot_schedule,
+        'prefix_cache': prefix_cache,
         'capped_incomplete': False,
     }
     stats.update({f'{key}_per_step': values for key, values in diagnostics_per_step.items()})
