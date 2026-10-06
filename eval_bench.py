@@ -34,6 +34,7 @@ from transformers import AutoModel, AutoTokenizer
 from decode import generate
 from hierarchy_decode import generate_hierarchy
 from decode_confidence_v2 import generate as generate_confidence_pivot_v2
+from decode_confidence_v3 import generate as generate_confidence_pivot_v3
 from wino_decode import generate as generate_wino, load_model as load_wino_model
 from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
 from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
@@ -329,6 +330,7 @@ def main():
         'decode_sha256': hashlib.sha256(Path(__file__).with_name('decode.py').read_bytes()).hexdigest(),
         'hierarchy_decode_sha256': hashlib.sha256(Path(__file__).with_name('hierarchy_decode.py').read_bytes()).hexdigest(),
         'decode_confidence_v2_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v2.py').read_bytes()).hexdigest(),
+        'decode_confidence_v3_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v3.py').read_bytes()).hexdigest(),
         'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
         'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
         'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -345,7 +347,7 @@ def main():
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'wino_decode.py', 'fastdllm_decode.py', Path(__file__).name):
+    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'decode_confidence_v3.py', 'wino_decode.py', 'fastdllm_decode.py', Path(__file__).name):
         (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
     workdir = out_dir / 'exec_tmp'
     workdir.mkdir(exist_ok=True)
@@ -388,6 +390,7 @@ def main():
         remasking = kwargs.pop('remasking')
         decoder = {'hierarchy': generate_hierarchy,
                    'confidence_pivot_v2': generate_confidence_pivot_v2,
+                   'confidence_pivot_v3': generate_confidence_pivot_v3,
                    'wino': generate_wino,
                    'fastdllm': generate_fastdllm}.get(remasking, generate)
         target = model

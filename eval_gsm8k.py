@@ -35,6 +35,7 @@ from decode import generate
 from hierarchy_decode import generate_hierarchy
 from decode_confidence import generate as generate_confidence_pivot
 from decode_confidence_v2 import generate as generate_confidence_pivot_v2
+from decode_confidence_v3 import generate as generate_confidence_pivot_v3
 from wino_decode import generate as generate_wino, load_model as load_wino_model
 from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
 from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
@@ -180,6 +181,7 @@ def main():
         'hierarchy_decode_sha256': hashlib.sha256(Path(__file__).with_name('hierarchy_decode.py').read_bytes()).hexdigest(),
         'decode_confidence_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence.py').read_bytes()).hexdigest(),
         'decode_confidence_v2_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v2.py').read_bytes()).hexdigest(),
+        'decode_confidence_v3_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v3.py').read_bytes()).hexdigest(),
         'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
         'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
         'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -199,7 +201,7 @@ def main():
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence.py', 'decode_confidence_v2.py', 'wino_decode.py', 'fastdllm_decode.py', 'eval_gsm8k.py'):
+    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence.py', 'decode_confidence_v2.py', 'decode_confidence_v3.py', 'wino_decode.py', 'fastdllm_decode.py', 'eval_gsm8k.py'):
         (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
     write_json(out_dir / 'samples.json', [{'test_index': i, **dataset[i]} for i in indices])
     records_path = out_dir / 'results.jsonl'
@@ -242,6 +244,7 @@ def main():
         decoder = {'hierarchy': generate_hierarchy,
                    'confidence_pivot': generate_confidence_pivot,
                    'confidence_pivot_v2': generate_confidence_pivot_v2,
+                   'confidence_pivot_v3': generate_confidence_pivot_v3,
                    'wino': generate_wino,
                    'fastdllm': generate_fastdllm}.get(remasking, generate)
         target = model
