@@ -1,334 +1,249 @@
-"""Confidence-filtered random pivots with bulk completion of small intervals.
-
-Intervals of length <= small_interval_size at the start of a step commit all
-their tokens, regardless of confidence. Larger intervals use the original
-confidence-filtered random pivot rule. Children created by a pivot are processed
-only on the next forward, so their predictions can use the committed pivot.
-
-Example (model and prompt already loaded):
-    from decode_confidence_v2 import generate
-    output, stats = generate(
-        model, prompt, gen_length=256, block_length=32,
-        confidence_threshold=0.75, small_interval_size=2, pivots_per_interval=32,
-        return_stats=True,
-    )
-    # Dynamic p: the pivot budget depends on the interval size.
-    output, stats = generate(
-        model, prompt, gen_length=256, block_length=32,
-        confidence_threshold=0.75, small_interval_size=2,
-        pivot_schedule=[[16, 32], [8, 16], [4, 4], [2, 2]], return_stats=True,
-    )
-    # Dynamic threshold: tau(A) = 0.75 + (0.85 - 0.75) * |A| / block_length.
-    output, stats = generate(
-        model, prompt, gen_length=256, block_length=32,
-        confidence_threshold=0.75, confidence_threshold_max=0.85,
-        small_interval_size=2, pivots_per_interval=32, return_stats=True,
-    )
-
-This module does not load models or start experiments when imported or executed.
-"""
-
+"""Confidence pivots with a fixed prefix KV cache, refreshed at every block."""
+import ast
+import inspect
 import math
+import textwrap
+import types
 
 import torch
 
-from decode import add_gumbel_noise
 
+def prepare_prefix_cache(model):
+    """Enable the existing cache implementation in stock HF LLaDA, if needed.
 
-_DIAGNOSTICS = ('candidates', 'deferred', 'fallback', 'bulk_intervals', 'bulk_tokens', 'intervals')
-
-
-def pivot_budget(interval_size, pivots_per_interval, pivot_schedule):
-    """Pivots allowed for an interval: the first [min_size, p] with size > min_size wins.
-
-    pivot_schedule is a list of [min_size, p] pairs in descending min_size order;
-    sizes at or below the last min_size use its p. None means a fixed budget.
+    Only the known cache prohibition is removed, on this model instance.
+    Weights, attention, RoPE, and use_cache=False behavior are unchanged.
+    Models already supporting caching are left alone. No disk files are edited.
     """
-    if pivot_schedule is None:
-        return pivots_per_interval
-    for min_size, budget in pivot_schedule:
-        if interval_size > min_size:
-            return budget
-    return pivot_schedule[-1][1]
+    core = getattr(model, 'model', None)
+    if core is None or type(core).__name__ != 'LLaDAModel':
+        return 'native'
+    if getattr(core, '_prefix_cache_prepared', False):
+        return 'stock_llada_guard_removed'
+    method = core.forward
+    try:
+        source = textwrap.dedent(inspect.getsource(method))
+    except (OSError, TypeError):
+        return 'native'
+    tree = ast.parse(source)
+    function = tree.body[0]
+    expected = ast.dump(ast.parse('past_key_values is None and not use_cache', mode='eval').body)
+    guards = [node for node in function.body if isinstance(node, ast.Assert)
+              and ast.dump(node.test) == expected]
+    if not guards:
+        return 'native'
+    if (len(guards) != 1 or core.config.alibi or not core.config.rope
+            or 'self.get_bidirectional_attention_bias(' not in source
+            or getattr(method.__func__, '__closure__', None)):
+        raise RuntimeError('Unrecognized LLaDA cache implementation; use a cache-capable model.')
+    function.body.remove(guards[0])
+    function.decorator_list = []
+    # Compile inside a class to preserve Python's private-name mangling (__cache).
+    wrapper = ast.ClassDef(name='LLaDAModel', bases=[], keywords=[], body=[function], decorator_list=[])
+    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
+                              wrapper], type_ignores=[])
+    namespace = dict(method.__func__.__globals__)
+    exec(compile(ast.fix_missing_locations(module), '<llada-prefix-cache>', 'exec'), namespace)
+    core.forward = types.MethodType(namespace['LLaDAModel'].forward, core)
+    core._prefix_cache_prepared = True
+    return 'stock_llada_guard_removed'
 
 
-def interval_threshold(interval_size, confidence_threshold, confidence_threshold_max, block_length):
-    """Confidence cutoff for an interval, linear in its size.
+def _prefix_only(cache, length):
+    if not isinstance(cache, (tuple, list)) or not cache:
+        raise RuntimeError('ours requires a model returning legacy (key, value) KV tuples; cache is missing or unsupported.')
+    result = []
+    for layer in cache:
+        if not isinstance(layer, (tuple, list)) or len(layer) != 2:
+            raise RuntimeError('Expected one (key, value) pair per layer.')
+        for tensor in layer:
+            if tensor.ndim != 4 or tensor.shape[-2] < length:
+                raise RuntimeError('Expected KV shape [batch, heads, sequence, head_dim].')
+        # Clone: a view would retain the entire full-sequence cache allocation.
+        result.append(tuple(t[:, :, :length, :] for t in layer))
+    return tuple(result)
 
-    tau(A) = confidence_threshold + (confidence_threshold_max - confidence_threshold)
-    * |A| / block_length, so a full block uses confidence_threshold_max and the
-    cutoff relaxes towards confidence_threshold as intervals shrink. None means
-    the fixed confidence_threshold.
-    """
-    if confidence_threshold_max is None:
-        return confidence_threshold
-    return (confidence_threshold
-            + (confidence_threshold_max - confidence_threshold) * interval_size / block_length)
 
-
-def select_pivots(confidence, intervals, confidence_threshold, small_interval_size=2,
-                  pivots_per_interval=1, pivot_schedule=None,
-                  confidence_threshold_max=None, block_length=None):
-    """Complete existing small intervals and select pivots per eligible large one.
-
-    Each large interval commits up to its pivot budget of distinct positions,
-    sampled uniformly without replacement from its above-threshold candidates.
-    The budget is pivots_per_interval, or pivot_budget(size) with pivot_schedule.
-    The cutoff is confidence_threshold, or interval_threshold(size) when
-    confidence_threshold_max is given.
-
-    confidence: (batch, block_length) predicted-token probabilities.
-    intervals: per-sample lists of half-open, block-relative masked intervals.
-    CPU position sampling follows torch.manual_seed(). Copy the small confidence
-    matrix once per step; avoid a separate GPU synchronization for each interval.
-
-    The per-sample global-best fallback runs only when neither bulk completion
-    nor an eligible pivot makes progress. candidates counts above-threshold
-    positions in all input intervals, including those completed in bulk.
-    deferred counts only intervals carried forward without any token committed.
-    intervals logs every interval that reaches the pivot rule (size >
-    small_interval_size): its size, cutoff, eligible count, budget and selected pivots.
-    """
-    scores = confidence.detach().cpu()
-    selected = torch.zeros(scores.shape, dtype=torch.bool)
-    next_intervals = []
-    diagnostics = {key: [] for key in _DIAGNOSTICS}
-
-    for batch_index, sample_intervals in enumerate(intervals):
-        pivots = {}
-        completed = set()
-        candidate_count = 0
-        bulk_tokens = 0
-        interval_log = []
-        for interval_index, (start, end) in enumerate(sample_intervals):
-            threshold = interval_threshold(end - start, confidence_threshold,
-                                           confidence_threshold_max, block_length)
-            eligible = torch.nonzero(
-                scores[batch_index, start:end] >= threshold,
-                as_tuple=True,
-            )[0]
-            candidate_count += eligible.numel()
-            if end - start <= small_interval_size:
-                selected[batch_index, start:end] = True
-                completed.add(interval_index)
-                bulk_tokens += end - start
-                continue
-            budget = pivot_budget(end - start, pivots_per_interval, pivot_schedule)
-            interval_log.append({
-                'interval_size': end - start,
-                'threshold': threshold,
-                'eligible_count': eligible.numel(),
-                'pivot_budget': budget,
-                'selected_pivots': min(budget, eligible.numel()),
-            })
-            if eligible.numel():
-                count = min(budget, eligible.numel())
-                choice = torch.randperm(eligible.numel(), device='cpu')[:count]
-                pivots[interval_index] = sorted((start + eligible[choice]).tolist())
-
-        fallback = bool(sample_intervals) and not completed and not pivots
-        if fallback:
-            # Only unresolved intervals participate; never select a prompt,
-            # previously committed token, or a future block. Ties go leftmost.
-            best_score = float('-inf')
-            for interval_index, (start, end) in enumerate(sample_intervals):
-                position = start + scores[batch_index, start:end].argmax().item()
-                value = scores[batch_index, position].item()
-                if value > best_score:
-                    best_score = value
-                    best_interval, best_position = interval_index, position
-            if not math.isfinite(best_score):
-                raise ValueError('No finite predicted-token confidence in an active sample.')
-            pivots[best_interval] = [best_position]
-
-        children = []
-        for interval_index, (start, end) in enumerate(sample_intervals):
-            if interval_index in completed:
-                continue
-            if interval_index not in pivots:
-                children.append((start, end))
-                continue
-            # Even small children wait for a new forward conditioned on these pivots.
-            child_start = start
-            for pivot in pivots[interval_index]:
-                selected[batch_index, pivot] = True
-                if child_start < pivot:
-                    children.append((child_start, pivot))
-                child_start = pivot + 1
-            if child_start < end:
-                children.append((child_start, end))
-        next_intervals.append(children)
-        diagnostics['candidates'].append(candidate_count)
-        diagnostics['deferred'].append(len(sample_intervals) - len(pivots) - len(completed))
-        diagnostics['fallback'].append(int(fallback))
-        diagnostics['bulk_intervals'].append(len(completed))
-        diagnostics['bulk_tokens'].append(bulk_tokens)
-        diagnostics['intervals'].append(interval_log)
-
-    return selected.to(confidence.device), next_intervals, diagnostics
+def _add_gumbel_noise(logits, temperature):
+    # Same sampling rule as decode.py, without importing the optional baseline.
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    return logits.exp() / ((-torch.log(noise)) ** temperature)
 
 
 @torch.no_grad()
-def generate(model, prompt, attention_mask=None, steps=None, gen_length=128,
-             block_length=32, temperature=0., cfg_scale=0., mask_id=126336,
-             confidence_threshold=0.8, logits_eos_inf=False, eos_token_id=126081,
-             return_stats=False, small_interval_size=2, pivots_per_interval=1,
-             pivot_schedule=None, confidence_threshold_max=None, prefix_cache=False):
-    """Generate with confidence-filtered random pivots and small-interval completion.
+def generate(
+    model,
+    prompt,
+    gen_length=128,
+    block_length=32,
+    temperature=0.0,
+    mask_id=126336,
+    n=2,
+    confidence_threshold=0.9,
+    logits_eos_inf=False,
+    eos_token_id=126081,
+    *,
+    attention_mask=None,
+    return_stats=False,
+    remask_k=0,
+    remask_threshold=0.5,
+    n_switch_threshold=128,
+):
+    """Fill each MASK interval, then optionally remask across the current block.
 
-    Blocks are processed sequentially while the model attends to the full
-    sequence. Each step uses one shared forward for all active intervals:
-      * Existing intervals of length <= small_interval_size commit every token,
-        even below confidence_threshold.
-      * Larger intervals commit up to pivots_per_interval uniformly sampled
-        above-threshold pivots (without replacement), or wait when there is
-        no candidate. pivot_schedule ([[min_size, p], ...], descending
-        min_size) replaces the fixed budget with one chosen by interval size.
-      * Newly created children become eligible only on the next forward.
-    When a sample would otherwise commit nothing, its most confident masked
-    token is committed as a fallback, even below the confidence threshold.
-
-    small_interval_size is a non-negative integer. The default is 2; 1 bypasses
-    confidence-based waiting for singleton intervals, and 0 disables bulk
-    completion to recover the original confidence-pivot rule.
-
-    confidence_threshold is an absolute probability cutoff in [0, 1]. Confidence
-    is the FP32 vocabulary softmax probability of the proposed token, after CFG
-    and MASK/optional EOS suppression, before sampling noise. With temperature
-    > 0, score the sampled token, not necessarily argmax.
-
-    confidence_threshold_max makes the cutoff depend on the interval size:
-    tau(A) = confidence_threshold + (confidence_threshold_max -
-    confidence_threshold) * |A| / block_length. A fresh block starts at
-    confidence_threshold_max and the cutoff relaxes as its intervals shrink.
-
-    prefix_cache uses Fast-dLLM's prefix KV cache: the first forward of a block
-    is a full forward whose keys/values for everything before the block are
-    kept; later forwards of the block recompute only the block and the suffix.
-    It needs a model that accepts past_key_values (fastdllm_decode.load_model),
-    batch size 1 and cfg_scale 0; attention_mask is not passed to the model.
-
-    steps is accepted for compatibility but ignored: generation finishes when
-    no masked intervals remain. Each active sample commits at least one token
-    per step, so a block needs at most block_length forward calls. Previously
-    committed tokens are not remasked.
-
-    return_stats returns (output, stats). Per-step counts have shape
-    (forward_steps, batch_size), including zero counts for finished samples.
-    bulk_intervals_per_step and bulk_tokens_per_step count intervals and tokens
-    completed by the small-interval rule, regardless of their confidence.
-    intervals_per_step holds the per-interval pivot log of select_pivots.
+    On incomplete steps, remask up to remask_k committed tokens with the lowest
+    P(current token) strictly below remask_threshold. Newly committed tokens are
+    eligible too. Scores come from the SAME pre-update forward (no extra forward).
+    Completed blocks exit before remasking. remask_k=0 disables this policy.
     """
-    if not 0 <= confidence_threshold <= 1:
-        raise ValueError('confidence_threshold must be between 0 and 1.')
-    if confidence_threshold_max is not None and not confidence_threshold <= confidence_threshold_max <= 1:
-        raise ValueError('confidence_threshold_max must be between confidence_threshold and 1.')
-    if (isinstance(small_interval_size, bool)
-            or not isinstance(small_interval_size, int) or small_interval_size < 0):
-        raise ValueError('small_interval_size must be a non-negative integer.')
-    if (isinstance(pivots_per_interval, bool)
-            or not isinstance(pivots_per_interval, int) or pivots_per_interval < 1):
-        raise ValueError('pivots_per_interval must be a positive integer.')
-    if pivot_schedule is not None:
-        pivot_schedule = [[int(min_size), int(budget)] for min_size, budget in pivot_schedule]
-        if (not pivot_schedule or any(b < 1 for _, b in pivot_schedule)
-                or any(a[0] <= b[0] for a, b in zip(pivot_schedule, pivot_schedule[1:]))):
-            raise ValueError('pivot_schedule needs [min_size, p>=1] pairs in descending min_size order.')
+    if prompt.ndim != 2 or prompt.shape[0] != 1 or prompt.shape[1] == 0:
+        raise ValueError(
+            'prefix-cache generation requires nonempty prompt shape '
+            '(1, prompt_length).'
+        )
     if gen_length <= 0 or block_length <= 0 or gen_length % block_length:
-        raise ValueError('Positive gen_length must be divisible by positive block_length.')
-    if prompt.ndim != 2 or prompt.shape[0] == 0:
-        raise ValueError('prompt must have shape (non-empty batch, prompt_length).')
-    if attention_mask is not None and attention_mask.shape != prompt.shape:
-        raise ValueError('attention_mask must have the same shape as prompt.')
-    if temperature < 0 or cfg_scale < 0:
-        raise ValueError('temperature and cfg_scale must be non-negative.')
-    if prefix_cache and (prompt.shape[0] != 1 or cfg_scale > 0):
-        raise ValueError('prefix_cache needs batch size 1 and cfg_scale 0.')
+        raise ValueError(
+            'gen_length must be positive and divisible by block_length.'
+        )
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError('n must be a positive integer.')
+    if (
+        isinstance(remask_k, bool)
+        or not isinstance(remask_k, int)
+        or remask_k < 0
+    ):
+        raise ValueError('remask_k must be a non-negative integer.')
+    if not 0.0 <= remask_threshold <= 1.0:
+        raise ValueError('remask_threshold must be between 0 and 1.')
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError('confidence_threshold must be between 0 and 1.')
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError('temperature must be finite and non-negative.')
 
-    base_model = getattr(model, 'module', model)
-    model_name = getattr(getattr(base_model, 'config', None), '_name_or_path', '')
-    if 'illada' in model_name.lower() and prompt.shape[0] != 1:
-        raise ValueError('iLLaDA currently does not support padded batch generation.')
+    if attention_mask is not None:
+        if (
+            attention_mask.shape != prompt.shape
+            or not bool(attention_mask.eq(1).all())
+        ):
+            raise ValueError('ours supports an unpadded single prompt only.')
 
     device = model.device
-    batch_size, prompt_length = prompt.shape
-    x = torch.full((batch_size, prompt_length + gen_length), mask_id,
-                   dtype=torch.long, device=device)
-    x[:, :prompt_length] = prompt.to(device)
-    if attention_mask is not None:
-        attention_mask = torch.cat([
-            attention_mask.to(device),
-            torch.ones((batch_size, gen_length), dtype=attention_mask.dtype, device=device),
-        ], dim=-1)
-    prompt_index = x != mask_id
-    unmasked_per_step = []
-    diagnostics_per_step = {key: [] for key in _DIAGNOSTICS}
-    steps_per_block = []
-    forward_steps = 0
+    prompt = prompt.to(device)
+    if bool(prompt.eq(mask_id).any()):
+        raise ValueError('The prompt must not contain MASK tokens.')
+    prompt_length = prompt.shape[1]
+    x = torch.full((1, prompt_length + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_length] = prompt
+    index = torch.arange(block_length, device=device)
+    counts = []
+    remasked_counts = []
+    forward_steps = prefill_steps = cached_steps = 0
 
     for block_start in range(prompt_length, prompt_length + gen_length, block_length):
         block_end = block_start + block_length
-        intervals = [[(0, block_length)] for _ in range(batch_size)]
-        block_steps = 0
+        block = x[0, block_start:block_end]
         past_key_values = None
-        while any(intervals):
-            if prefix_cache and past_key_values is None:
+
+        # An incomplete step fills >= n tokens and remasks <= k < n.
+        # Net progress is positive, so block_length steps still suffice.
+        for step_idx in range(block_length):
+            if past_key_values is None:
                 output = model(x, use_cache=True)
-                logits = output.logits[:, block_start:block_end]
-                past_key_values = [tuple(t[:, :, :block_start] for t in layer)
-                                   for layer in output.past_key_values]
-                del output
-            elif prefix_cache:
-                logits = model(x[:, block_start:], past_key_values=past_key_values,
-                               use_cache=True).logits[:, :block_length]
-            elif cfg_scale > 0:
-                unconditioned = x.clone()
-                unconditioned[prompt_index] = mask_id
-                inputs = torch.cat([x, unconditioned], dim=0)
-                masks = (torch.cat([attention_mask, attention_mask], dim=0)
-                         if attention_mask is not None else None)
-                logits = model(inputs, attention_mask=masks).logits[:, block_start:block_end]
-                conditioned, unconditioned_logits = logits.chunk(2, dim=0)
-                logits = unconditioned_logits + (cfg_scale + 1) * (conditioned - unconditioned_logits)
+                # BF16 -> FP32 already copies; no additional logits clone.
+                logits = output.logits[0, block_start:block_end].float()
+                past_key_values = _prefix_only(getattr(output, 'past_key_values', None), block_start)
+                prefill_steps += 1
             else:
-                logits = model(x, attention_mask=attention_mask).logits[:, block_start:block_end]
+                output = model(x[:, block_start:], past_key_values=past_key_values, use_cache=True)
+                logits = output.logits[0, :block_length].float()
+                cached_steps += 1
+                # Keep the fixed prefix; do not append current/future mask positions.
+            del output
+            forward_steps += 1
 
             logits[..., mask_id] = -torch.inf
             if logits_eos_inf:
                 logits[..., eos_token_id] = -torch.inf
-            predictions = add_gumbel_noise(logits, temperature).argmax(dim=-1)
-            float_logits = logits.float()
-            confidence = torch.exp(
-                float_logits.gather(-1, predictions.unsqueeze(-1)).squeeze(-1)
-                - torch.logsumexp(float_logits, dim=-1)
-            )
-            selected, intervals, diagnostics = select_pivots(
-                confidence, intervals, confidence_threshold, small_interval_size,
-                pivots_per_interval, pivot_schedule, confidence_threshold_max, block_length)
-            block = x[:, block_start:block_end]
-            block[selected] = predictions[selected]
-            forward_steps += 1
-            block_steps += 1
-            if return_stats:
-                unmasked_per_step.append(selected.sum(dim=1))
-                for key, values in diagnostics.items():
-                    diagnostics_per_step[key].append(values)
-            del logits, float_logits, confidence, predictions
-        steps_per_block.append(block_steps)
+            if temperature == 0.0:
+                predicted_logits, predictions = logits.max(dim=-1)
+            else:
+                predictions = _add_gumbel_noise(logits, temperature).argmax(dim=-1)
+                predicted_logits = logits.gather(1, predictions[:, None]).squeeze(1)
+            log_normalizer = torch.logsumexp(logits, dim=-1)
+            confidence = (predicted_logits - log_normalizer).exp()
+            del logits
+            masked = block.eq(mask_id)
+            starts = masked.clone()
+            starts[1:] &= ~masked[:-1]
+            segment = starts.cumsum(dim=0)
+            same_interval = masked[:, None] & masked[None, :] & segment[:, None].eq(segment[None, :])
+            interval_size = same_interval.sum(dim=1)
+            eligible = masked & confidence.ge(confidence_threshold)
+            eligible_count = (same_interval & eligible[None, :]).sum(dim=1)
 
-    if not return_stats:
-        return x
-    stats = {
-        'forward_steps': forward_steps,
-        'steps_per_block': steps_per_block,
-        'unmasked_per_step': torch.stack(unmasked_per_step).cpu().tolist(),
-        'confidence_threshold': confidence_threshold,
-        'confidence_threshold_max': confidence_threshold_max,
-        'small_interval_size': small_interval_size,
-        'pivots_per_interval': pivots_per_interval,
-        'pivot_schedule': pivot_schedule,
-        'prefix_cache': prefix_cache,
-        'capped_incomplete': False,
-    }
-    stats.update({f'{key}_per_step': values for key, values in diagnostics_per_step.items()})
-    return x, stats
+            ##############################################################################
+            interval_left = torch.where(
+                starts, index, 0
+            ).cummax(dim=0).values
+
+            ends = masked.clone()
+            ends[:-1] &= ~masked[1:]
+
+            interval_right = torch.where(
+                ends, index, block_length
+            ).flip(0).cummin(dim=0).values.flip(0)
+
+            center_score = -(
+                2 * index - interval_left - interval_right
+            ).abs().to(confidence.dtype)
+
+            enough = eligible_count.ge(n)
+            priority = torch.where(
+                enough,
+                torch.where(eligible, center_score, -torch.inf),
+                torch.where(eligible, 2.0, confidence),
+            )
+            ##############################################################################
+
+            higher_priority = same_interval & (
+                priority[None, :].gt(priority[:, None])
+                | (priority[None, :].eq(priority[:, None]) & index[None, :].lt(index[:, None])))
+            rank = higher_priority.sum(dim=1)
+            selected = masked & (interval_size.le(n) | rank.lt(n))
+            ##############################################################################
+            if step_idx <= 2:
+                first_selected = masked & confidence.ge(confidence_threshold)
+
+                selected = torch.where(
+                    first_selected.any(),
+                    first_selected,
+                    selected,
+                )
+            ##############################################################################
+            block[selected] = predictions[selected]
+
+            if return_stats:
+                num_unmasked = (
+                    selected & ~block.eq(mask_id)
+                ).sum()
+                counts.append(num_unmasked.reshape(1))
+
+            if not block.eq(mask_id).any():
+                break
+        else:
+            raise RuntimeError('Block did not finish; check model logits for NaN/Inf or MASK-only predictions.')
+        # Refresh from the full updated sequence at the next block boundary.
+        del past_key_values
+
+    if return_stats:
+        stats = {
+            'forward_steps': forward_steps,
+            'unmasked_per_step': torch.stack(counts).cpu().tolist(),
+            'prefill_steps': prefill_steps, 'cached_steps': cached_steps,
+            'prefix_cache': True, 'capped_incomplete': False,
+        }
+        return x, stats
+    return x

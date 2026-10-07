@@ -1,0 +1,7 @@
+{
+  "interval_n2_tau09": {
+    "remasking": "confidence_pivot_v2",
+    "n": 2,
+    "confidence_threshold": 0.9
+  }
+}

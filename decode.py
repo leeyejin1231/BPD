@@ -6,11 +6,6 @@ from transformers import AutoTokenizer, AutoModel
 
 
 def add_gumbel_noise(logits, temperature):
-    '''
-    The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-    Thus, we use float64.
-    '''
     if temperature == 0:
         return logits
     logits = logits.to(torch.float64)
@@ -20,13 +15,6 @@ def add_gumbel_noise(logits, temperature):
 
 
 def get_num_transfer_tokens(mask_index, steps):
-    '''
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-    '''
     mask_num = mask_index.sum(dim=1, keepdim=True)
 
     base = mask_num // steps
@@ -269,13 +257,14 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
+                attention_mask_ = None
                 if attention_mask is not None:
                     attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                logits = model(x_, attention_mask=attention_mask_).logits
+                logits = model(x_, attention_mask=attention_mask_, use_cache=False).logits
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
-                logits = model(x, attention_mask=attention_mask).logits
+                logits = model(x, attention_mask=attention_mask, use_cache=False).logits
 
             logits = apply_end_think_logit_boost(
                 logits,
