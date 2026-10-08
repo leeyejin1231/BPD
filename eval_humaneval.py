@@ -28,6 +28,7 @@ from decode_confidence_v2 import generate as generate_confidence_pivot_v2
 from decode_confidence_v3 import generate as generate_confidence_pivot_v3
 from wino_decode import generate as generate_wino, load_model as load_wino_model
 from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
+from fastdllm_dream_decode import generate as generate_fastdllm_dream, load_model as load_fastdllm_dream_model
 from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
 
 
@@ -193,6 +194,7 @@ def main():
         'decode_confidence_v3_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v3.py').read_bytes()).hexdigest(),
         'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
         'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
+        'fastdllm_dream_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_dream_decode.py').read_bytes()).hexdigest(),
         'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'metrics': {
             'pass_at_1': 'One greedy sample per task; prompt + extracted code + test + check(entry_point) executed in a subprocess with timeout.',
@@ -208,7 +210,7 @@ def main():
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'decode_confidence_v3.py', 'wino_decode.py', 'fastdllm_decode.py', Path(__file__).name):
+    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'decode_confidence_v3.py', 'wino_decode.py', 'fastdllm_decode.py', 'fastdllm_dream_decode.py', Path(__file__).name):
         (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
     workdir = out_dir / 'exec_tmp'
     workdir.mkdir(exist_ok=True)
@@ -222,10 +224,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
     uses_wino = any(v['remasking'] == 'wino' for v in variants.values())
     uses_fastdllm = any(v['remasking'] == 'fastdllm' or v.get('prefix_cache') for v in variants.values())
-    if uses_fastdllm and (uses_wino or args.model_family == 'dream'):
-        raise ValueError('fastdllm needs its own LLaDA modeling: run it alone, on --model-family llada.')
+    if uses_fastdllm and uses_wino:
+        raise ValueError('fastdllm needs its own modeling: run it alone.')
+    if args.model_family == 'dream' and any(v.get('prefix_cache') for v in variants.values()):
+        raise ValueError('prefix_cache is not ported to Dream; only remasking=fastdllm uses its cache.')
     if args.model_family == 'dream':
-        model = load_dream_model(args.model)
+        model = load_fastdllm_dream_model(args.model) if uses_fastdllm else load_dream_model(args.model)
         mask_id, end_ids = DREAM_MASK_ID, set(DREAM_END_IDS)
     else:
         if uses_wino:
@@ -255,6 +259,8 @@ def main():
                    'wino': generate_wino,
                    'fastdllm': generate_fastdllm}.get(remasking, generate)
         target = model
+        if decoder is generate_fastdllm and args.model_family == 'dream':
+            decoder = generate_fastdllm_dream  # Fast-dLLM's own Dream modeling, loaded above
         if decoder is generate_wino and args.model_family == 'dream':
             target, kwargs['dream'] = model.model, True  # raw Dream model; shadow-slot shift handled inside
         if decoder is generate:
