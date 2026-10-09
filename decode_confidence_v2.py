@@ -64,6 +64,21 @@ def _prefix_only(cache, length):
     return tuple(result)
 
 
+def _dream_prefix_only(cache, length):
+    """Prefix slice of Fast-dLLM's Dream cache: one (key, value) pair per layer, [B, S, hidden]."""
+    if not isinstance(cache, (tuple, list)) or not cache:
+        raise RuntimeError('dream=True requires Fast-dLLM Dream modeling returning (key, value) tuples.')
+    result = []
+    for layer in cache:
+        if not isinstance(layer, (tuple, list)) or len(layer) != 2:
+            raise RuntimeError('Expected one (key, value) pair per layer.')
+        for tensor in layer:
+            if tensor.ndim != 3 or tensor.shape[1] < length:
+                raise RuntimeError('Expected Dream KV shape [batch, sequence, hidden].')
+        result.append(tuple(t[:, :length, :].clone() for t in layer))
+    return result
+
+
 def _add_gumbel_noise(logits, temperature):
     # Same sampling rule as decode.py, without importing the optional baseline.
     if temperature == 0:
@@ -91,8 +106,16 @@ def generate(
     remask_k=0,
     remask_threshold=0.5,
     n_switch_threshold=128,
+    force_confidence=None,
+    dream=False,
 ):
     """Fill each MASK interval, then optionally remask across the current block.
+
+    dream=True runs on Fast-dLLM's Dream modeling (fastdllm_dream_decode.load_model):
+    forwards use attention_mask="full"; the KV cache holds [B, S, hidden] per layer; and
+    since Dream predicts token i from the logits at i-1, the cached prefix stops at
+    block_start-1 and each step feeds x[:, block_start-1:], so the block's logits are the
+    first block_length rows of the output with no shift.
 
     On incomplete steps, remask up to remask_k committed tokens with the lowest
     P(current token) strictly below remask_threshold. Newly committed tokens are
@@ -120,6 +143,8 @@ def generate(
         raise ValueError('remask_threshold must be between 0 and 1.')
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError('confidence_threshold must be between 0 and 1.')
+    if force_confidence is not None and not 0.0 <= force_confidence <= 1.0:
+        raise ValueError('force_confidence must be None or between 0 and 1.')
     if not math.isfinite(temperature) or temperature < 0:
         raise ValueError('temperature must be finite and non-negative.')
 
@@ -150,7 +175,20 @@ def generate(
         # An incomplete step fills >= n tokens and remasks <= k < n.
         # Net progress is positive, so block_length steps still suffice.
         for step_idx in range(block_length):
-            if past_key_values is None:
+            if dream:
+                if past_key_values is None:
+                    output = model(x, attention_mask='full', position_ids=None, use_cache=True)
+                    # Logits at i-1 predict token i: block tokens come from rows s-1 .. e-2.
+                    logits = output.logits[0, block_start - 1:block_end - 1].float()
+                    past_key_values = _dream_prefix_only(
+                        getattr(output, 'past_key_values', None), block_start - 1)
+                    prefill_steps += 1
+                else:
+                    output = model(x[:, block_start - 1:], attention_mask='full', position_ids=None,
+                                   past_key_values=past_key_values, use_cache=True)
+                    logits = output.logits[0, :block_length].float()
+                    cached_steps += 1
+            elif past_key_values is None:
                 output = model(x, use_cache=True)
                 # BF16 -> FP32 already copies; no additional logits clone.
                 logits = output.logits[0, block_start:block_end].float()
@@ -174,6 +212,13 @@ def generate(
                 predicted_logits = logits.gather(1, predictions[:, None]).squeeze(1)
             log_normalizer = torch.logsumexp(logits, dim=-1)
             confidence = (predicted_logits - log_normalizer).exp()
+            if force_confidence is not None:
+                # DAPD-style direct rule: softmax over the bf16 logits (the
+                # model's native dtype), so a top-1 probability rounds to 1.0
+                # once the logit gap exceeds ~5.5 instead of ~16.6 in fp32.
+                force_hit = torch.softmax(
+                    logits.to(torch.bfloat16), dim=-1
+                ).max(dim=-1).values.ge(force_confidence)
             del logits
             masked = block.eq(mask_id)
             starts = masked.clone()
@@ -222,6 +267,11 @@ def generate(
                     first_selected,
                     selected,
                 )
+            ##############################################################################
+            if force_confidence is not None:
+                # Always commit tokens whose bf16 confidence reaches
+                # force_confidence, regardless of n, interval rank, or step index.
+                selected = selected | (masked & force_hit)
             ##############################################################################
             block[selected] = predictions[selected]
 

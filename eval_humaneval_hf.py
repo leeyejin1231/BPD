@@ -1,4 +1,8 @@
-"""Resumable HumanEval for LLaDA: ours by default, optional low_confidence.
+"""Resumable HumanEval for LLaDA or Dream: ours by default, optional baselines.
+
+Baselines: low_confidence / random / random_pivot (decode.py), hierarchy, wino and fastdllm;
+eval_models.py picks the model implementation each one needs and handles --model-family dream
+(ours is LLaDA-only).
 
 Downloads openai/openai_humaneval from Hugging Face on first use.
 Candidate programs are executed with a timeout, as in the supplied evaluator.
@@ -6,7 +10,6 @@ Candidate programs are executed with a timeout, as in the supplied evaluator.
 import argparse
 import hashlib
 import importlib
-import inspect
 import json
 import os
 import re
@@ -19,10 +22,12 @@ from pathlib import Path
 import torch
 import transformers
 from datasets import Dataset, load_dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 
-# Baseline and optional custom model loader are imported only when selected.
+# Baselines and the optional custom model loader are imported only when selected.
 from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options,
+                         load_model, resolve_loader, run_baseline, source_files)
 
 
 MODES = ('low_confidence', 'ours')
@@ -170,8 +175,8 @@ def get_variants(args):
         decoder = kwargs.pop('decoder', kwargs.pop('remasking', label))
         if decoder == 'confidence_pivot_v2':
             decoder = 'ours'
-        if decoder not in ('ours', 'low_confidence', 'random_pivot', 'random'):
-            raise ValueError(f'{label}: unsupported decoder {decoder!r}.')
+        if decoder not in DECODERS:
+            raise ValueError(f'{label}: unsupported decoder {decoder!r}; choose from {DECODERS}.')
         # Model selection must never be inferred from a baseline's options.
         cache = kwargs.pop('prefix_cache', None)
         if cache is not None and (decoder != 'ours' or cache is not True):
@@ -182,8 +187,9 @@ def get_variants(args):
             kwargs.setdefault('confidence_threshold', args.confidence_threshold)
             kwargs.setdefault('remask_k', args.remask_k)
             kwargs.setdefault('remask_threshold', args.remask_threshold)
+            kwargs.setdefault('force_confidence', args.force_confidence)
             allowed = {'n', 'confidence_threshold', 'logits_eos_inf', 'eos_token_id',
-                       'remask_k', 'remask_threshold'}
+                       'remask_k', 'remask_threshold', 'force_confidence'}
             n, k = kwargs['n'], kwargs['remask_k']
             if isinstance(n, bool) or not isinstance(n, int) or n < 1:
                 raise ValueError(f'{label}: n must be a positive integer.')
@@ -192,11 +198,7 @@ def get_variants(args):
             if not 0 <= kwargs['remask_threshold'] <= 1:
                 raise ValueError(f'{label}: remask_threshold must be between 0 and 1.')
         else:
-            from decode import generate as baseline
-            reserved = {'model', 'prompt', 'attention_mask', 'steps', 'gen_length',
-                        'block_length', 'temperature', 'cfg_scale', 'remasking',
-                        'mask_id', 'return_stats'}
-            allowed = set(inspect.signature(baseline).parameters) - reserved
+            allowed = baseline_options(decoder, args.model_family)
         if set(kwargs) - allowed:
             raise ValueError(f'{label}: unsupported options: {sorted(set(kwargs) - allowed)}')
         result[label] = {'decoder': decoder, **kwargs}
@@ -206,33 +208,40 @@ def get_variants(args):
 def run_decoder(model, encoded, variant, args, mask_id):
     kwargs = dict(variant)
     decoder = kwargs.pop('decoder')
-    common = dict(gen_length=args.gen_length, block_length=args.block_length,
-                  mask_id=mask_id, temperature=0.0, return_stats=True)
     if decoder == 'ours':
         return generate_ours(model, encoded['input_ids'],
-                             attention_mask=encoded.get('attention_mask'), **common, **kwargs)
-    from decode import generate as baseline
-    return baseline(model, encoded['input_ids'],
-                    attention_mask=encoded.get('attention_mask'),
-                    steps=args.steps, cfg_scale=0.0, remasking=decoder, **common, **kwargs)
+                             attention_mask=encoded.get('attention_mask'),
+                             gen_length=args.gen_length, block_length=args.block_length,
+                             mask_id=mask_id, temperature=0.0, return_stats=True,
+                             dream=args.model_family == 'dream', **kwargs)
+    return run_baseline(model, args.model_family, decoder, kwargs,
+                        encoded['input_ids'], encoded.get('attention_mask'),
+                        mask_id=mask_id, gen_length=args.gen_length,
+                        block_length=args.block_length, steps=args.steps)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True)
+    parser.add_argument('--model-family', choices=MODEL_FAMILIES, default='llada',
+                        help='dream: Dream-v0-Instruct-7B for the baselines (vanilla/hierarchy via dream_adapter, '
+                             'wino on the raw model, fastdllm via fastdllm_dream_decode); ours is LLaDA-only')
     parser.add_argument('--dataset', default='openai/openai_humaneval', help='HF dataset ID or local Arrow file')
     parser.add_argument('--dataset-split', default='test')
     parser.add_argument('--dataset-revision', default='main')
     parser.add_argument('--cache-dir', default=None)
     parser.add_argument('--model-revision', default=None)
     parser.add_argument('--local-files-only', action='store_true', help='Use cached model/tokenizer files only')
-    parser.add_argument('--model-loader', default='hf', help='hf or module:function (for example fastdllm_decode:load_model)')
+    parser.add_argument('--model-loader', default='hf',
+                        help='hf (auto: the implementation the selected decoders need) or a custom module:function; '
+                             'a custom loader cannot be combined with wino/fastdllm or --model-family dream')
     parser.add_argument('--native-cache-only', action='store_true', help='Disable the stock LLaDA cache compatibility patch')
-    parser.add_argument('--methods', nargs='+', choices=('ours', 'low_confidence', 'random_pivot'), default=['ours'])
+    parser.add_argument('--methods', nargs='+', choices=DECODERS, default=['ours'])
     parser.add_argument('--n', type=int, default=2)
     parser.add_argument('--confidence-threshold', type=float, default=0.9)
     parser.add_argument('--remask-k', type=int, default=0, help='Remask at most k tokens per incomplete block step; 0 disables, k < n')
     parser.add_argument('--remask-threshold', type=float, default=0.3, help='Only remask tokens with current-token probability strictly below this value')
+    parser.add_argument('--force-confidence', type=float, default=None, help='Always unmask tokens whose confidence >= this value (None disables)')
     parser.add_argument('--output', required=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gen-length', type=int, default=256)
@@ -260,12 +269,15 @@ def main():
         if args.steps < blocks or args.steps % blocks:
             parser.error('--steps must be positive and divisible by the number of blocks for low_confidence/random.')
     uses_ours = any(v['decoder'] == 'ours' for v in variants.values())
-    loader = args.model_loader
+    loader = resolve_loader(variants, args.model_family)
     source_paths = [Path(__file__).resolve(), Path(__file__).with_name('decode_confidence_v2.py').resolve()]
-    if any(v['decoder'] != 'ours' for v in variants.values()):
-        source_paths.append(Path(__file__).with_name('decode.py').resolve())
+    source_paths.extend(source_files(variants, args.model_family))
     custom_load = None
-    if loader != 'hf':
+    if args.model_loader != 'hf':
+        if loader != 'hf':
+            parser.error(f'--model-loader cannot be combined with a run that needs loader {loader!r} '
+                         '(wino/fastdllm or --model-family dream select their own model implementation).')
+        loader = args.model_loader
         module_name, sep, function_name = loader.partition(':')
         if not sep:
             parser.error('--model-loader must be hf or module:function.')
@@ -322,15 +334,16 @@ def main():
             raise ValueError('For a custom loader, pass a pinned local checkpoint as --model instead of --model-revision.')
         model = custom_load(args.model)
     else:
-        model = AutoModel.from_pretrained(args.model, dtype=torch.bfloat16,
-                                          **pretrained).to('cuda').eval()
+        model = load_model(args.model, loader, pretrained)
     model.eval()
     # No global cache toggle: each decoder explicitly chooses use_cache per call.
     if uses_ours and loader == 'hf' and not args.native_cache_only:
         print('Cache preparation: ' + prepare_prefix_cache(model), flush=True)
     print('Decoders: ' + json.dumps(variants, ensure_ascii=False), flush=True)
-    print(f'Model loader: {loader}; ours uses prefix KV cache independently of baseline selection.', flush=True)
-    mask_id, end_ids = 126336, {126081, 126348}
+    print(f'Model family: {args.model_family}; loader: {loader}; '
+          'ours uses prefix KV cache independently of baseline selection.', flush=True)
+    ids = TOKEN_IDS[args.model_family]
+    mask_id, end_ids = ids['mask_id'], set(ids['end_ids'])
     eos = tokenizer.eos_token_id
     if eos is not None:
         end_ids.add(eos)

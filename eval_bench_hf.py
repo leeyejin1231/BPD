@@ -1,7 +1,9 @@
-"""Resumable HF MATH-500 / MBPP / IFEval evaluation for LLaDA.
+"""Resumable HF MATH-500 / MBPP / IFEval evaluation for LLaDA or Dream.
 
 Default: ours only; decode_confidence_v2.py must be beside this file.
-Optional baselines are imported only when requested.
+Optional baselines (low_confidence / random / random_pivot, hierarchy, wino, fastdllm) are
+imported only when requested; eval_models.py picks the model implementation each one needs
+and handles --model-family dream (ours is LLaDA-only).
 HF defaults: MATH-500 test; MBPP full/test; IFEval train.
 Local Arrow files remain supported via --dataset.
 
@@ -30,8 +32,10 @@ from pathlib import Path
 import torch
 import transformers
 from datasets import Dataset, load_dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options,
+                         load_model, resolve_loader, run_baseline, source_files)
 
 def last_boxed(text):
     """Return the content of the last \\boxed{...} / \\fbox{...} with balanced braces, else None."""
@@ -296,11 +300,6 @@ def get_variants(args):
         raise ValueError('variant-config must be a nonempty JSON object.')
 
     variants = {}
-    reserved = {
-        'model', 'prompt', 'attention_mask', 'steps', 'gen_length',
-        'block_length', 'temperature', 'cfg_scale', 'remasking',
-        'mask_id', 'return_stats',
-    }
 
     for label, value in raw.items():
         if not isinstance(value, dict):
@@ -313,7 +312,8 @@ def get_variants(args):
 
         if decoder == 'ours':
             for key in (
-                'n', 'confidence_threshold', 'remask_k', 'remask_threshold'
+                'n', 'confidence_threshold', 'remask_k', 'remask_threshold',
+                'force_confidence',
             ):
                 options.setdefault(key, getattr(args, key))
 
@@ -323,6 +323,7 @@ def get_variants(args):
             allowed = {
                 'n', 'confidence_threshold', 'remask_k', 'remask_threshold',
                 'logits_eos_inf', 'eos_token_id', 'n_switch_threshold',
+                'force_confidence',
             }
 
             integer_options = [('n', 1), ('remask_k', 0)]
@@ -345,9 +346,8 @@ def get_variants(args):
                         f'{label}: {key} must be between 0 and 1.'
                     )
 
-        elif decoder in ('low_confidence', 'random_pivot', 'random'):
-            from decode import generate as baseline
-            allowed = set(inspect.signature(baseline).parameters) - reserved
+        elif decoder in BASELINES:
+            allowed = baseline_options(decoder, args.model_family)
 
         else:
             raise ValueError(f'{label}: unsupported decoder {decoder!r}.')
@@ -369,29 +369,22 @@ def get_variants(args):
 def run_decoder(model, encoded, variant, args):
     options = dict(variant)
     decoder = options.pop('decoder')
-    common = dict(
-        gen_length=args.gen_length,
-        block_length=args.block_length,
-        temperature=0.0,
-        mask_id=126336,
-        return_stats=True,
-        attention_mask=encoded.get('attention_mask'),
-    )
+    mask_id = TOKEN_IDS[args.model_family]['mask_id']
 
     if decoder == 'ours':
         return generate_ours(
-            model, encoded['input_ids'], **common, **options
+            model, encoded['input_ids'],
+            gen_length=args.gen_length, block_length=args.block_length,
+            temperature=0.0, mask_id=mask_id, return_stats=True,
+            attention_mask=encoded.get('attention_mask'),
+            dream=args.model_family == 'dream', **options,
         )
 
-    from decode import generate as baseline
-    return baseline(
-        model,
-        encoded['input_ids'],
-        steps=args.steps,
-        cfg_scale=0.0,
-        remasking=decoder,
-        **common,
-        **options,
+    return run_baseline(
+        model, args.model_family, decoder, options,
+        encoded['input_ids'], encoded.get('attention_mask'),
+        mask_id=mask_id, gen_length=args.gen_length,
+        block_length=args.block_length, steps=args.steps,
     )
 
 
@@ -463,6 +456,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--task', required=True, choices=sorted(TASKS))
     parser.add_argument('--model', required=True)
+    parser.add_argument('--model-family', choices=MODEL_FAMILIES, default='llada',
+                        help='dream: Dream-v0-Instruct-7B for the baselines (vanilla/hierarchy via '
+                             'dream_adapter, wino on the raw model, fastdllm via fastdllm_dream_decode); '
+                             'ours is LLaDA-only')
     parser.add_argument('--dataset', help='HF dataset ID or local Arrow file; defaults by task')
     parser.add_argument('--dataset-config')
     parser.add_argument('--dataset-split')
@@ -481,12 +478,13 @@ def main():
     parser.add_argument('--exec-timeout', type=float, default=10.0)
     parser.add_argument('--limit', type=int, help='First N selected examples, after sharding')
     parser.add_argument('--shard', help='k/n; use a separate output directory per shard')
-    parser.add_argument('--methods', nargs='+', default=['ours'],
-                        choices=('ours', 'low_confidence', 'random_pivot', 'random'))
+    parser.add_argument('--methods', nargs='+', default=['ours'], choices=DECODERS)
     parser.add_argument('--n', type=int, default=1)
     parser.add_argument('--confidence-threshold', type=float, default=0.9)
     parser.add_argument('--remask-k', type=int, default=0)
     parser.add_argument('--remask-threshold', type=float, default=0.5)
+    parser.add_argument('--force-confidence', type=float, default=None,
+                        help='Always unmask tokens whose bf16 confidence >= this value (None disables)')
     parser.add_argument('--n-switch-threshold', type=int, default=None,
                         help='Omit to use the current decoder default, if it has this schedule')
     parser.add_argument('--variant-config', help='Optional JSON; decoder/remasking aliases supported')
@@ -504,8 +502,9 @@ def main():
     if args.dataset_split is None:
         args.dataset_split = dataset_split
     variants = get_variants(args)
+    loader = resolve_loader(variants, args.model_family)
     blocks = args.gen_length // args.block_length
-    if any(v['decoder'] != 'ours' for v in variants.values()):
+    if any(v['decoder'] in ('low_confidence', 'random') for v in variants.values()):
         if args.steps < blocks or args.steps % blocks:
             parser.error('--steps must be positive and divisible by the number of blocks.')
 
@@ -519,9 +518,7 @@ def main():
     sources = [Path(__file__).resolve()]
     if any(v['decoder'] == 'ours' for v in variants.values()):
         sources.append(Path(inspect.getfile(inspect.unwrap(generate_ours))).resolve())
-    if any(v['decoder'] != 'ours' for v in variants.values()):
-        from decode import generate as baseline
-        sources.append(Path(inspect.getfile(inspect.unwrap(baseline))).resolve())
+    sources.extend(source_files(variants, args.model_family))
     ifeval_sources = []
     if args.task == 'ifeval':
         try:
@@ -542,10 +539,11 @@ def main():
     config = vars(args).copy()
     config['cli_decoder_defaults'] = {
         key: config.pop(key) for key in (
-            'n', 'confidence_threshold', 'remask_k', 'remask_threshold', 'n_switch_threshold')
+            'n', 'confidence_threshold', 'remask_k', 'remask_threshold', 'n_switch_threshold',
+            'force_confidence')
     }
     config.update({
-        'model_family': 'llada', 'model_loader': 'hf',
+        'model_family': args.model_family, 'model_loader': loader,
         'num_tasks': len(indices), 'test_indices': indices,
         'dataset_fingerprint': getattr(dataset, '_fingerprint', None),
         'batch_size': 1, 'num_fewshot': 0, 'variants': variants,
@@ -598,12 +596,13 @@ def main():
         pretrained['revision'] = args.model_revision
     print(f'Loading {args.model}; variants={json.dumps(variants)}', flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, **pretrained)
-    model = AutoModel.from_pretrained(
-        args.model, dtype=torch.bfloat16, **pretrained,
-    ).to('cuda').eval()
-    if any(v['decoder'] == 'ours' for v in variants.values()) and not args.native_cache_only:
+    model = load_model(args.model, loader, pretrained)
+    print(f'Model family: {args.model_family}; loader: {loader}', flush=True)
+    if (loader == 'hf' and any(v['decoder'] == 'ours' for v in variants.values())
+            and not args.native_cache_only):
         print('Cache preparation: ' + prepare_prefix_cache(model), flush=True)
-    mask_id, end_ids = 126336, {126081, 126348}
+    ids = TOKEN_IDS[args.model_family]
+    mask_id, end_ids = ids['mask_id'], set(ids['end_ids'])
     if tokenizer.eos_token_id is not None:
         end_ids.add(tokenizer.eos_token_id)
     special_ids = set(tokenizer.all_special_ids) | end_ids | {mask_id}
