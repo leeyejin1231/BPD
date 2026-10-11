@@ -99,7 +99,7 @@ def generate(
     n=2,
     confidence_threshold=0.9,
     logits_eos_inf=False,
-    eos_token_id=126081,
+    eos_token_id=None,
     *,
     attention_mask=None,
     return_stats=False,
@@ -111,17 +111,28 @@ def generate(
 ):
     """Fill each MASK interval, then optionally remask across the current block.
 
-    dream=True runs on Fast-dLLM's Dream modeling (fastdllm_dream_decode.load_model):
-    forwards use attention_mask="full"; the KV cache holds [B, S, hidden] per layer; and
-    since Dream predicts token i from the logits at i-1, the cached prefix stops at
-    block_start-1 and each step feeds x[:, block_start-1:], so the block's logits are the
-    first block_length rows of the output with no shift.
+    dream=True delegates to decode_confidence_v2_dream.generate: Fast-dLLM's Dream
+    block/cache mechanics (full forward per block that commits position 0, shifted
+    logits, bf16 sample_tokens) with this file's selection policy. eos_token_id defaults
+    to 126081 (LLaDA) or 151643 (Dream).
 
     On incomplete steps, remask up to remask_k committed tokens with the lowest
     P(current token) strictly below remask_threshold. Newly committed tokens are
     eligible too. Scores come from the SAME pre-update forward (no extra forward).
     Completed blocks exit before remasking. remask_k=0 disables this policy.
     """
+    if dream:
+        from decode_confidence_v2_dream import generate as generate_dream
+        return generate_dream(
+            model, prompt, gen_length=gen_length, block_length=block_length,
+            temperature=temperature, mask_id=mask_id, n=n,
+            confidence_threshold=confidence_threshold, logits_eos_inf=logits_eos_inf,
+            eos_token_id=151643 if eos_token_id is None else eos_token_id,
+            attention_mask=attention_mask, return_stats=return_stats, remask_k=remask_k,
+            remask_threshold=remask_threshold, n_switch_threshold=n_switch_threshold,
+            force_confidence=force_confidence)
+    if eos_token_id is None:
+        eos_token_id = 126081
     if prompt.ndim != 2 or prompt.shape[0] != 1 or prompt.shape[1] == 0:
         raise ValueError(
             'prefix-cache generation requires nonempty prompt shape '

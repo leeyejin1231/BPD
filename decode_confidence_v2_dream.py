@@ -1,22 +1,28 @@
-"""Confidence pivots with a fixed prefix KV cache, refreshed at every block: Dream port.
+"""Confidence pivots on Dream-v0-Instruct-7B with Fast-dLLM's block/cache mechanics.
 
-decode_confidence_v2.py on Dream-v0-Instruct-7B. The selection policy (interval
-centering, n-quota, step<=2 fast path, force_confidence) is copied verbatim; only the
-model boundary differs from LLaDA:
-  * the Hugging Face Dream modeling does not accept past_key_values, so load_model()
-    builds the model with Fast-dLLM's modeling_dream.py (same weights, native KV cache;
-    the LLaDA assert-removal in prepare_prefix_cache is therefore not needed);
-  * its KV cache is a list of (key, value) per layer with shape [batch, sequence, hidden]
-    (projected but not yet split into heads), so the prefix is sliced on dim 1;
-  * the forward takes attention_mask="full" (fully bidirectional) and recomputes position
-    ids itself from the cache length;
-  * Dream predicts the token at position i from the logits at position i-1, so block
-    logits are shifted right by one. The prefill forward yields the shifted row for every
-    block position. A cached forward sees only x[:, block_start:], so the predictor row of
-    block position 0 (raw position block_start-1) lives in the frozen prefix: it is taken
-    from the prefill forward, consistent with keeping the prefix KV fixed within a block.
-    (Fast-dLLM instead commits block position 0 from the full forward; that would change
-    the policy, so it is not done here.)
+Everything except the token-selection policy follows Fast-dLLM's Dream decoder
+(Fast-dLLM/v1/dream/model/generation_utils_block.py, prefix cache, dual_cache=False):
+  * the model is Fast-dLLM's modeling_dream.py (the stock HF Dream modeling does not
+    accept past_key_values); its KV cache is a list of (key, value) per layer with shape
+    [batch, sequence, hidden], the forward takes attention_mask="full" and recomputes
+    position ids from the cache length;
+  * every block starts with one full forward; Dream predicts position i from the logits
+    at i-1, so the logits are shifted right by one and block position 0 is committed from
+    that forward unconditionally (Fast-dLLM does this because the predictor row of
+    position 0 lives in the prefix, which the cache then freezes); the keys/values
+    before the block are kept as the prefix cache;
+  * every later forward sees x[:, block_start:] with the cached prefix and shifts the
+    suffix logits the same way (row 0 of the shift is a duplicate, but position 0 is
+    already committed, so it is never selected);
+  * tokens and confidences come from Fast-dLLM's sample_tokens on the bf16 logits
+    (softmax; temperature 0 -> argmax and its probability, otherwise logits/temperature
+    and a categorical sample with the sampled token's probability). Unlike Fast-dLLM,
+    the MASK logit is set to -inf before sampling (every forward, including the one that
+    commits position 0), and logits_eos_inf optionally does the same for EOS.
+The selection policy (interval centering, n-quota, step<=2 fast path, force_confidence)
+is decode_confidence_v2.py's, verbatim; step_idx counts the policy forwards, so the
+Fast-dLLM full forward that commits position 0 is not a policy step. force_confidence
+compares against the same bf16 softmax confidence that drives the policy.
 Batch size 1, unpadded. Token ids follow dream_adapter: mask 151666, eos/pad 151643.
 """
 import math
@@ -38,6 +44,17 @@ def prepare_prefix_cache(model):
     return 'native'
 
 
+def _sample_tokens():
+    """Fast-dLLM's sample_tokens (generation_utils_block.py), loaded the way the baseline loads it."""
+    from fastdllm_dream_decode import _block_generation
+    return _block_generation().sample_tokens
+
+
+def _shift(logits):
+    # Fast-dLLM: logits at i-1 predict token i.
+    return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+
 def _prefix_only(cache, length):
     if not isinstance(cache, (tuple, list)) or not cache:
         raise RuntimeError('ours requires a model returning legacy (key, value) KV tuples; cache is missing or unsupported.')
@@ -50,15 +67,6 @@ def _prefix_only(cache, length):
                 raise RuntimeError('Expected Dream KV shape [batch, sequence, hidden].')
         result.append(tuple(t[:, :length, :] for t in layer))
     return tuple(result)
-
-
-def _add_gumbel_noise(logits, temperature):
-    # Same sampling rule as decode.py, without importing the optional baseline.
-    if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    return logits.exp() / ((-torch.log(noise)) ** temperature)
 
 
 @torch.no_grad()
@@ -81,12 +89,10 @@ def generate(
     n_switch_threshold=128,
     force_confidence=None,
 ):
-    """Fill each MASK interval, then optionally remask across the current block.
+    """Fill each MASK interval of a block with Fast-dLLM's Dream block/cache mechanics.
 
-    On incomplete steps, remask up to remask_k committed tokens with the lowest
-    P(current token) strictly below remask_threshold. Newly committed tokens are
-    eligible too. Scores come from the SAME pre-update forward (no extra forward).
-    Completed blocks exit before remasking. remask_k=0 disables this policy.
+    remask_k / remask_threshold / n_switch_threshold are accepted for interface parity
+    with decode_confidence_v2.py; remasking is not implemented on Dream.
     """
     if prompt.ndim != 2 or prompt.shape[0] != 1 or prompt.shape[1] == 0:
         raise ValueError(
@@ -125,61 +131,54 @@ def generate(
     prompt = prompt.to(device)
     if bool(prompt.eq(mask_id).any()):
         raise ValueError('The prompt must not contain MASK tokens.')
+    sample_tokens = _sample_tokens()
     prompt_length = prompt.shape[1]
     x = torch.full((1, prompt_length + gen_length), mask_id, dtype=torch.long, device=device)
     x[:, :prompt_length] = prompt
     index = torch.arange(block_length, device=device)
     counts = []
-    remasked_counts = []
     forward_steps = prefill_steps = cached_steps = 0
 
     for block_start in range(prompt_length, prompt_length + gen_length, block_length):
         block_end = block_start + block_length
         block = x[0, block_start:block_end]
-        past_key_values = None
-        boundary_logits = None  # raw row at block_start-1: predictor of block position 0
 
-        # An incomplete step fills >= n tokens and remasks <= k < n.
-        # Net progress is positive, so block_length steps still suffice.
+        # Fast-dLLM block start: one full forward fills the cache and commits block
+        # position 0 from the shifted logits (raw row block_start-1), unconditionally.
+        output = model(x, attention_mask='full', position_ids=None, use_cache=True)
+        first_logits = output.logits[0, block_start - 1:block_start].clone()
+        first_logits[..., mask_id] = -torch.inf
+        if logits_eos_inf:
+            first_logits[..., eos_token_id] = -torch.inf
+        _, first = sample_tokens(first_logits, temperature=temperature)
+        block[0] = first[0]
+        past_key_values = _prefix_only(getattr(output, 'past_key_values', None), block_start)
+        del output
+        forward_steps += 1
+        prefill_steps += 1
+        if return_stats:
+            counts.append(torch.ones(1, dtype=torch.long, device=device))
+
+        # Policy steps on the cached prefix. Each step fills >= 1 token, so
+        # block_length steps suffice for the block_length-1 remaining masks.
         for step_idx in range(block_length):
-            if past_key_values is None:
-                output = model(x, attention_mask='full', position_ids=None, use_cache=True)
-                # Dream: logits at i-1 predict token i. Rows block_start-1 .. block_end-2
-                # are the shifted logits of the block. BF16 -> FP32 copies; no extra clone.
-                logits = output.logits[0, block_start - 1:block_end - 1].float()
-                boundary_logits = logits[:1].clone()
-                past_key_values = _prefix_only(getattr(output, 'past_key_values', None), block_start)
-                prefill_steps += 1
-            else:
-                output = model(x[:, block_start:], attention_mask='full', position_ids=None,
-                               past_key_values=past_key_values, use_cache=True)
-                # Suffix rows 0 .. block_length-2 predict block positions 1 .. block_length-1;
-                # block position 0 keeps the frozen-prefix row from the prefill forward.
-                logits = torch.cat(
-                    [boundary_logits, output.logits[0, :block_length - 1].float()], dim=0
-                )
-                cached_steps += 1
-                # Keep the fixed prefix; do not append current/future mask positions.
+            output = model(x[:, block_start:], attention_mask='full', position_ids=None,
+                           past_key_values=past_key_values, use_cache=True)
+            # Fast-dLLM shift on the suffix logits (bf16, model dtype); keep the block rows.
+            logits = _shift(output.logits)[0, :block_length]
             del output
             forward_steps += 1
+            cached_steps += 1
 
+            logits = logits.clone()
             logits[..., mask_id] = -torch.inf
             if logits_eos_inf:
                 logits[..., eos_token_id] = -torch.inf
-            if temperature == 0.0:
-                predicted_logits, predictions = logits.max(dim=-1)
-            else:
-                predictions = _add_gumbel_noise(logits, temperature).argmax(dim=-1)
-                predicted_logits = logits.gather(1, predictions[:, None]).squeeze(1)
-            log_normalizer = torch.logsumexp(logits, dim=-1)
-            confidence = (predicted_logits - log_normalizer).exp()
+            confidence, predictions = sample_tokens(logits, temperature=temperature)
+            confidence = confidence.float()
             if force_confidence is not None:
-                # DAPD-style direct rule: softmax over the bf16 logits (the
-                # model's native dtype), so a top-1 probability rounds to 1.0
-                # once the logit gap exceeds ~5.5 instead of ~16.6 in fp32.
-                force_hit = torch.softmax(
-                    logits.to(torch.bfloat16), dim=-1
-                ).max(dim=-1).values.ge(force_confidence)
+                # Same bf16 softmax confidence as Fast-dLLM's threshold rule.
+                force_hit = confidence.ge(force_confidence)
             del logits
             masked = block.eq(mask_id)
             starts = masked.clone()
