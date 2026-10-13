@@ -1,4 +1,4 @@
-## 준비
+## preparation
 ### Fast-dLLM
 ```bash
 git clone https://github.com/NVlabs/Fast-dLLM.git
