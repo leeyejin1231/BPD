@@ -1,13 +1,6 @@
-"""Paired, resumable HumanEval (164 tasks) benchmark for the local LLaDA decoders (one GPU).
-
-Protocol mirrors eval_gsm8k.py: same checkpoint, gen 256 / block 32 / steps 256,
-temperature 0, BF16, batch 1, per-question alternating method order, per-question
-seed 42 + index. pass@1 uses one greedy sample per task and the official
-HumanEval test harness logic (prompt + completion + test + check(entry_point))
-executed in a subprocess with a timeout.
-"""
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -19,18 +12,15 @@ from pathlib import Path
 
 import torch
 import transformers
-from datasets import Dataset
-from transformers import AutoModel, AutoTokenizer
+from datasets import Dataset, load_dataset
+from transformers import AutoTokenizer
 
-from decode import generate
-from hierarchy_decode import generate_hierarchy
-from decode_confidence_v2 import generate as generate_confidence_pivot_v2
-from wino_decode import generate as generate_wino, load_model as load_wino_model
-from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
-from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
+# Baselines and the optional custom model loader are imported only when selected.
+from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options, load_model, resolve_loader, run_baseline, source_files)
 
 
-MODES = ('low_confidence', 'random_pivot')
+MODES = ('low_confidence', 'ours')
 STOP_SEQUENCES = ('\nif __name__', '\nprint(', '\nassert ')
 
 
@@ -41,7 +31,6 @@ def write_json(path, value):
 
 
 def extract_code(text):
-    """Return (code, source). Prefer the first fenced python block, then any fence, else raw text."""
     fenced = re.findall(r'```(?:python|py|Python)?[ \t]*\n(.*?)(?:```|$)', text, flags=re.S)
     if fenced:
         return fenced[0], 'fence'
@@ -49,7 +38,6 @@ def extract_code(text):
 
 
 def build_program(prompt, code, entry_point):
-    """Combine prompt and model code the way lm-eval/Fast-dLLM instruct HumanEval evals do."""
     code = code.rstrip()
     defines = re.search(rf'^\s*def\s+{re.escape(entry_point)}\s*\(', code, flags=re.M) is not None
     if defines:
@@ -68,11 +56,10 @@ def build_program(prompt, code, entry_point):
 
 
 def run_tests(program, test, entry_point, timeout, workdir):
-    """Execute program + test + check(entry_point) in a fresh interpreter. Returns (passed, status, stderr_tail)."""
     source = program + '\n\n' + test + '\n\n' + f'check({entry_point})\n'
     with tempfile.TemporaryDirectory(dir=workdir) as tmp:
         path = Path(tmp) / 'candidate.py'
-        path.write_text(source)
+        path.write_text(source, encoding='utf-8')
         try:
             proc = subprocess.run(
                 [sys.executable, '-I', str(path)], cwd=tmp, capture_output=True, text=True,
@@ -139,18 +126,106 @@ def summarize(rows):
         if pairs:
             summary['paired'] = {
                 'n': len(pairs),
-                'decode_speedup': sum(p['low_confidence']['decode_seconds'] for p in pairs) / sum(p['random_pivot']['decode_seconds'] for p in pairs),
-                'vanilla_only_passed': sum(p['low_confidence']['passed'] and not p['random_pivot']['passed'] for p in pairs),
-                'pivot_only_passed': sum(p['random_pivot']['passed'] and not p['low_confidence']['passed'] for p in pairs),
-                'both_passed': sum(p['random_pivot']['passed'] and p['low_confidence']['passed'] for p in pairs),
+                'decode_speedup': sum(p['low_confidence']['decode_seconds'] for p in pairs) / sum(p['ours']['decode_seconds'] for p in pairs),
+                'vanilla_only_passed': sum(p['low_confidence']['passed'] and not p['ours']['passed'] for p in pairs),
+                'ours_only_passed': sum(p['ours']['passed'] and not p['low_confidence']['passed'] for p in pairs),
+                'both_passed': sum(p['ours']['passed'] and p['low_confidence']['passed'] for p in pairs),
             }
     return summary
+
+
+def load_humaneval(args):
+    path = Path(args.dataset).expanduser()
+    if path.is_file():
+        dataset = Dataset.from_file(str(path))
+    else:
+        dataset = load_dataset(args.dataset, split=args.dataset_split, revision=args.dataset_revision, cache_dir=args.cache_dir)
+    required = {'task_id', 'prompt', 'test', 'entry_point'}
+    if not required.issubset(dataset.column_names):
+        raise ValueError(f'Dataset is missing columns: {sorted(required - set(dataset.column_names))}')
+    return dataset
+
+
+def get_variants(args):
+    if args.variant_config:
+        raw = json.loads(Path(args.variant_config).read_text())
+    else:
+        raw = {mode: {'decoder': mode} for mode in args.methods}
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError('variant-config must be a nonempty JSON object.')
+    result = {}
+    for label, value in raw.items():
+        if not isinstance(value, dict):
+            raise ValueError(f'{label}: expected a dictionary of decoder options.')
+        kwargs = dict(value)
+        decoder = kwargs.pop('decoder', kwargs.pop('remasking', label))
+        if decoder == 'confidence_pivot_v2':
+            decoder = 'ours'
+        if decoder not in DECODERS:
+            raise ValueError(f'{label}: unsupported decoder {decoder!r}; choose from {DECODERS}.')
+        # Model selection must never be inferred from a baseline's options.
+        cache = kwargs.pop('prefix_cache', None)
+        if cache is not None and (decoder != 'ours' or cache is not True):
+            raise ValueError(f'{label}: prefix_cache is only supported as true for ours. Select a model implementation with --model-loader instead.')
+        if decoder == 'ours':
+            kwargs.setdefault('n', args.n)
+            kwargs.setdefault('confidence_threshold', args.confidence_threshold)
+            kwargs.setdefault('remask_k', args.remask_k)
+            kwargs.setdefault('remask_threshold', args.remask_threshold)
+            kwargs.setdefault('force_confidence', args.force_confidence)
+            allowed = {'n', 'confidence_threshold', 'logits_eos_inf', 'eos_token_id', 'remask_k', 'remask_threshold', 'force_confidence'}
+            n, k = kwargs['n'], kwargs['remask_k']
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise ValueError(f'{label}: n must be a positive integer.')
+            # if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < n:
+            #     raise ValueError(f'{label}: remask_k must satisfy 0 <= remask_k < n.')
+            if not 0 <= kwargs['remask_threshold'] <= 1:
+                raise ValueError(f'{label}: remask_threshold must be between 0 and 1.')
+        else:
+            allowed = baseline_options(decoder, args.model_family)
+        if set(kwargs) - allowed:
+            raise ValueError(f'{label}: unsupported options: {sorted(set(kwargs) - allowed)}')
+        result[label] = {'decoder': decoder, **kwargs}
+    return result
+
+
+def run_decoder(model, encoded, variant, args, mask_id):
+    kwargs = dict(variant)
+    decoder = kwargs.pop('decoder')
+    if decoder == 'ours':
+        return generate_ours(model, encoded['input_ids'],
+                             attention_mask=encoded.get('attention_mask'),
+                             gen_length=args.gen_length, block_length=args.block_length,
+                             mask_id=mask_id, temperature=0.0, return_stats=True,
+                             dream=args.model_family == 'dream', **kwargs)
+    return run_baseline(model, args.model_family, decoder, kwargs,
+                        encoded['input_ids'], encoded.get('attention_mask'),
+                        mask_id=mask_id, gen_length=args.gen_length,
+                        block_length=args.block_length, steps=args.steps)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True)
-    parser.add_argument('--dataset', required=True, help='Cached HumanEval test Arrow file')
+    parser.add_argument('--model-family', choices=MODEL_FAMILIES, default='llada',
+                        help='dream: Dream-v0-Instruct-7B for the baselines (vanilla/hierarchy via dream_adapter, '
+                             'wino on the raw model, fastdllm via fastdllm_dream_decode); ours is LLaDA-only')
+    parser.add_argument('--dataset', default='openai/openai_humaneval', help='HF dataset ID or local Arrow file')
+    parser.add_argument('--dataset-split', default='test')
+    parser.add_argument('--dataset-revision', default='main')
+    parser.add_argument('--cache-dir', default=None)
+    parser.add_argument('--model-revision', default=None)
+    parser.add_argument('--local-files-only', action='store_true', help='Use cached model/tokenizer files only')
+    parser.add_argument('--model-loader', default='hf',
+                        help='hf (auto: the implementation the selected decoders need) or a custom module:function; '
+                             'a custom loader cannot be combined with wino/fastdllm or --model-family dream')
+    parser.add_argument('--native-cache-only', action='store_true', help='Disable the stock LLaDA cache compatibility patch')
+    parser.add_argument('--methods', nargs='+', choices=DECODERS, default=['ours'])
+    parser.add_argument('--n', type=int, default=2)
+    parser.add_argument('--confidence-threshold', type=float, default=0.9)
+    parser.add_argument('--remask-k', type=int, default=0, help='Remask at most k tokens per incomplete block step; 0 disables, k < n')
+    parser.add_argument('--remask-threshold', type=float, default=0.3, help='Only remask tokens with current-token probability strictly below this value')
+    parser.add_argument('--force-confidence', type=float, default=None, help='Always unmask tokens whose confidence >= this value (None disables)')
     parser.add_argument('--output', required=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gen-length', type=int, default=256)
@@ -158,44 +233,60 @@ def main():
     parser.add_argument('--steps', type=int, default=256)
     parser.add_argument('--exec-timeout', type=float, default=10.0)
     parser.add_argument('--limit', type=int, default=None, help='Evaluate only the first N tasks (debug)')
-    parser.add_argument('--model-family', choices=('llada', 'dream'), default='llada',
-                        help='dream: Dream-v0-Instruct-7B via dream_adapter (shifted logits, full attention)')
     parser.add_argument('--variant-config', help='JSON mapping experiment labels to generate keyword arguments')
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is unavailable; this benchmark requires a GPU.')
     out_dir = Path(args.output).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    dataset = Dataset.from_file(args.dataset)
+    dataset = load_humaneval(args)
     indices = list(range(len(dataset)))[:args.limit]
-    variants = (json.loads(Path(args.variant_config).read_text()) if args.variant_config
-                else {mode: {'remasking': mode} for mode in MODES})
-    for label, kwargs in variants.items():
-        if not isinstance(kwargs, dict) or 'remasking' not in kwargs:
-            raise ValueError(f'{label}: specify generate keyword arguments including remasking.')
+    if args.limit is not None and args.limit < 1:
+        parser.error('--limit must be positive.')
+    if args.gen_length <= 0 or args.block_length <= 0 or args.gen_length % args.block_length:
+        parser.error('--gen-length must be positive and divisible by --block-length.')
+    if args.exec_timeout <= 0:
+        parser.error('--exec-timeout must be positive.')
+    variants = get_variants(args)
+    if any(v['decoder'] in ('low_confidence', 'random') for v in variants.values()):
+        blocks = args.gen_length // args.block_length
+        if args.steps < blocks or args.steps % blocks:
+            parser.error('--steps must be positive and divisible by the number of blocks for low_confidence/random.')
+    uses_ours = any(v['decoder'] == 'ours' for v in variants.values())
+    loader = resolve_loader(variants, args.model_family)
+    source_paths = [Path(__file__).resolve(), Path(__file__).with_name('decode_confidence_v2.py').resolve()]
+    source_paths.extend(source_files(variants, args.model_family))
+    custom_load = None
+    if args.model_loader != 'hf':
+        if loader != 'hf':
+            parser.error(f'--model-loader cannot be combined with a run that needs loader {loader!r} '
+                         '(wino/fastdllm or --model-family dream select their own model implementation).')
+        loader = args.model_loader
+        module_name, sep, function_name = loader.partition(':')
+        if not sep:
+            parser.error('--model-loader must be hf or module:function.')
+        module = importlib.import_module(module_name)
+        custom_load = getattr(module, function_name)
+        if getattr(module, '__file__', None):
+            source_paths.append(Path(module.__file__).resolve())
     modes_to_run = tuple(variants)
     prompt_template = ('Complete the following Python function. Reply with the complete '
                        'function definition in a ```python code block.\n\n```python\n{prompt}```')
     config = vars(args).copy()
     config.update({
-        'model_revision': Path(args.model).name,
+        'resolved_model_loader': loader,
+        'dataset_fingerprint': getattr(dataset, '_fingerprint', None),
         'num_tasks': len(indices), 'batch_size': 1, 'num_fewshot': 0,
         'variants': variants,
-        **({'model_family': args.model_family} if args.model_family != 'llada' else {}),
         'temperature': 0, 'cfg_scale': 0, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(0),
         'torch': torch.__version__, 'transformers': transformers.__version__,
         'prompt_template': prompt_template,
-        'decode_sha256': hashlib.sha256(Path(__file__).with_name('decode.py').read_bytes()).hexdigest(),
-        'hierarchy_decode_sha256': hashlib.sha256(Path(__file__).with_name('hierarchy_decode.py').read_bytes()).hexdigest(),
-        'decode_confidence_v2_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v2.py').read_bytes()).hexdigest(),
-        'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
-        'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
-        'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'source_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
         'metrics': {
             'pass_at_1': 'One greedy sample per task; prompt + extracted code + test + check(entry_point) executed in a subprocess with timeout.',
             'timing': 'CUDA-synchronized wall time around generate; excludes tokenization, loading, warmup, code extraction, and test execution.',
-            'tokens_per_second': 'Actual unmasked positions including special tokens and post-EOS positions / decode seconds.',
+            'tokens_per_second': 'Gross unmask events, including refills after remasking, special tokens and post-EOS positions / decode seconds. See final_tokens_per_second for final output throughput.',
             'answer_tokens_per_second': 'Non-special tokens before first EOS/EOT / decode seconds.',
             'tokens_per_step': 'Actual unmasked positions / forward calls, batch size 1.',
         },
@@ -206,34 +297,37 @@ def main():
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'wino_decode.py', 'fastdllm_decode.py', Path(__file__).name):
-        (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
+    for path in source_paths:
+        (source_dir / path.name).write_bytes(path.read_bytes())
     workdir = out_dir / 'exec_tmp'
     workdir.mkdir(exist_ok=True)
     records_path = out_dir / 'results.jsonl'
     rows = [json.loads(line) for line in records_path.read_text().splitlines()] if records_path.exists() else []
     done = {(r['test_index'], r['mode']) for r in rows}
     if len(done) == len(indices) * len(modes_to_run):
+        write_json(out_dir / 'summary.json', summarize(rows))
         print(json.dumps(summarize(rows), indent=2), flush=True)
         return
     print(f'Loading {args.model} on {config["gpu"]}', flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
-    uses_wino = any(v['remasking'] == 'wino' for v in variants.values())
-    uses_fastdllm = any(v['remasking'] == 'fastdllm' or v.get('prefix_cache') for v in variants.values())
-    if uses_fastdllm and (uses_wino or args.model_family == 'dream'):
-        raise ValueError('fastdllm needs its own LLaDA modeling: run it alone, on --model-family llada.')
-    if args.model_family == 'dream':
-        model = load_dream_model(args.model)
-        mask_id, end_ids = DREAM_MASK_ID, set(DREAM_END_IDS)
+    pretrained = dict(trust_remote_code=True, local_files_only=args.local_files_only)
+    if args.model_revision is not None:
+        pretrained['revision'] = args.model_revision
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **pretrained)
+    if custom_load is not None:
+        if args.model_revision is not None:
+            raise ValueError('For a custom loader, pass a pinned local checkpoint as --model instead of --model-revision.')
+        model = custom_load(args.model)
     else:
-        if uses_wino:
-            model = load_wino_model(args.model)
-        elif uses_fastdllm:
-            model = load_fastdllm_model(args.model)
-        else:
-            model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
-                                            local_files_only=True, torch_dtype=torch.bfloat16).to('cuda').eval()
-        mask_id, end_ids = 126336, {126081, 126348}
+        model = load_model(args.model, loader, pretrained)
+    model.eval()
+    # No global cache toggle: each decoder explicitly chooses use_cache per call.
+    if uses_ours and loader == 'hf' and not args.native_cache_only:
+        print('Cache preparation: ' + prepare_prefix_cache(model), flush=True)
+    print('Decoders: ' + json.dumps(variants, ensure_ascii=False), flush=True)
+    print(f'Model family: {args.model_family}; loader: {loader}; '
+          'ours uses prefix KV cache independently of baseline selection.', flush=True)
+    ids = TOKEN_IDS[args.model_family]
+    mask_id, end_ids = ids['mask_id'], set(ids['end_ids'])
     eos = tokenizer.eos_token_id
     if eos is not None:
         end_ids.add(eos)
@@ -245,27 +339,30 @@ def main():
         return tokenizer(text, add_special_tokens=False, return_tensors='pt').to('cuda')
 
     def run(encoded, mode):
-        kwargs = dict(variants[mode])
-        remasking = kwargs.pop('remasking')
-        decoder = {'hierarchy': generate_hierarchy,
-                   'confidence_pivot_v2': generate_confidence_pivot_v2,
-                   'wino': generate_wino,
-                   'fastdllm': generate_fastdllm}.get(remasking, generate)
-        target = model
-        if decoder is generate_wino and args.model_family == 'dream':
-            target, kwargs['dream'] = model.model, True  # raw Dream model; shadow-slot shift handled inside
-        if decoder is generate:
-            kwargs['remasking'] = remasking
-        return decoder(target, encoded['input_ids'],
-                       attention_mask=encoded['attention_mask'] if args.model_family == 'llada' else None,
-                       mask_id=mask_id,
-                       gen_length=args.gen_length, block_length=args.block_length, steps=args.steps,
-                       temperature=0, cfg_scale=0, return_stats=True, **kwargs)
+        return run_decoder(model, encoded, variants[mode], args, mask_id)
 
     warmup = encode('def add(a: int, b: int) -> int:\n    """Return the sum of a and b.\n    >>> add(1, 2)\n    3\n    """\n')
     for mode in modes_to_run:
         torch.manual_seed(args.seed)
-        run(warmup, mode)
+        warmup_tokens, warmup_stats = run(warmup, mode)
+        # if variants[mode]['decoder'] == 'ours' and warmup_stats['prefill_steps'] != args.gen_length // args.block_length:
+        #     raise RuntimeError('Unexpected cache prefill count.')
+        ################################################################################
+        if variants[mode]['decoder'] == 'ours':
+            generated_length = (
+                warmup_tokens.shape[1]
+                - warmup['input_ids'].shape[1]
+            )
+            expected_prefills = generated_length // args.block_length
+
+            if (
+                generated_length <= 0
+                or generated_length % args.block_length != 0
+                or warmup_stats['prefill_steps'] != expected_prefills
+            ):
+                raise RuntimeError('Unexpected cache prefill count.')
+        ################################################################################
+        del warmup_tokens, warmup_stats
         torch.cuda.synchronize()
         print(f'Warmup complete: {mode}', flush=True)
     del warmup
@@ -292,8 +389,7 @@ def main():
                 text = tokenizer.decode(generated[:end], skip_special_tokens=True)
                 code, code_source = extract_code(text)
                 program, program_kind = build_program(sample['prompt'], code, sample['entry_point'])
-                passed, status, error_tail = run_tests(program, sample['test'], sample['entry_point'],
-                                                       args.exec_timeout, workdir)
+                passed, status, error_tail = run_tests(program, sample['test'], sample['entry_point'], args.exec_timeout, workdir)
                 counts = [count[0] for count in stats['unmasked_per_step']]
                 row = {
                     'test_index': index, 'task_id': sample['task_id'], 'mode': mode, 'seed': sample_seed,

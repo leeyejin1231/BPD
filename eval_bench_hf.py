@@ -1,23 +1,8 @@
-"""Resumable MATH-500 / MBPP / IFEval benchmark for the local LLaDA decoders (one GPU).
-
-Protocol mirrors eval_gsm8k.py: same checkpoint, block 32, temperature 0, BF16,
-batch 1, per-question rotating method order, per-question seed 42 + index.
-
-Tasks
-  math500  HuggingFaceH4/MATH-500 test (500). Accuracy of the last \\boxed{} answer
-           under Hendrycks-style string normalization (plus numeric equality).
-  mbpp     google-research-datasets/mbpp full test (500). pass@1: extracted code +
-           test_setup_code + the three test_list asserts, run in a subprocess.
-  ifeval   google/IFEval (541). Prompt-level strict accuracy (primary), plus
-           instruction-level strict and both loose variants, using the checkers
-           vendored from lm-evaluation-harness in ifeval_lib/.
-
---shard k/n evaluates only indices with index % n == k into its own output
-directory; report_bench.py merges shards.
-"""
 import argparse
 import hashlib
+import inspect
 import json
+import math
 import os
 import re
 import subprocess
@@ -28,21 +13,12 @@ from pathlib import Path
 
 import torch
 import transformers
-from datasets import Dataset
-from transformers import AutoModel, AutoTokenizer
-
-from decode import generate
-from hierarchy_decode import generate_hierarchy
-from decode_confidence_v2 import generate as generate_confidence_pivot_v2
-from wino_decode import generate as generate_wino, load_model as load_wino_model
-from fastdllm_decode import generate as generate_fastdllm, load_model as load_fastdllm_model
-from dream_adapter import load_model as load_dream_model, MASK_ID as DREAM_MASK_ID, END_IDS as DREAM_END_IDS
-
-
-# ----------------------------------------------------------------------------- math500
+from datasets import Dataset, load_dataset
+from transformers import AutoTokenizer
+from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options, load_model, resolve_loader, run_baseline, source_files)
 
 def last_boxed(text):
-    """Return the content of the last \\boxed{...} / \\fbox{...} with balanced braces, else None."""
     start = max(text.rfind('\\boxed'), text.rfind('\\fbox'))
     if start < 0:
         return None
@@ -96,7 +72,6 @@ def _fix_a_slash_b(string):
 def _remove_right_units(string):
     if '\\text{ ' in string:
         splits = string.split('\\text{ ')
-        assert len(splits) == 2
         return splits[0]
     return string
 
@@ -115,7 +90,6 @@ def _fix_sqrt(string):
 
 
 def strip_string(string):
-    """Hendrycks MATH normalization (math_equivalence.strip_string) with a few extras."""
     string = str(string).replace('\n', '').replace('\\!', '').replace('\\\\', '\\')
     string = string.replace('tfrac', 'frac').replace('dfrac', 'frac')
     string = string.replace('\\left', '').replace('\\right', '')
@@ -141,12 +115,15 @@ def strip_string(string):
 def math_equal(prediction, gold):
     if prediction is None:
         return False
-    a, b = strip_string(prediction), strip_string(gold)
+    try:
+        a, b = strip_string(prediction), strip_string(gold)
+    except (ValueError, AssertionError, IndexError):
+        return False
     if a == b:
         return True
     try:
         return abs(float(a.replace(',', '')) - float(b.replace(',', ''))) < 1e-6
-    except ValueError:
+    except (ValueError, OverflowError):
         return False
 
 
@@ -171,7 +148,7 @@ def run_program(source, timeout, workdir):
         return True, 'passed', ''
     tail = proc.stderr.strip().splitlines()
     status = 'failed'
-    if any('SyntaxError' in line for line in tail[-3:]):
+    if any(name in line for line in tail[-3:] for name in ('SyntaxError', 'IndentationError', 'TabError')):
         status = 'syntax_error'
     elif tail and 'AssertionError' in tail[-1]:
         status = 'assertion_failed'
@@ -190,8 +167,7 @@ def ifeval_score(sample, response):
     no_first = '\n'.join(lines[1:]).strip()
     no_last = '\n'.join(lines[:-1]).strip()
     no_both = '\n'.join(lines[1:-1]).strip()
-    for v in (no_first, no_last, no_both, stripped, no_first.replace('*', ''),
-              no_last.replace('*', ''), no_both.replace('*', '')):
+    for v in (no_first, no_last, no_both, stripped, no_first.replace('*', ''), no_last.replace('*', ''), no_both.replace('*', '')):
         variants.append(v)
     for index, instruction_id in enumerate(ids):
         instruction = instructions_registry.INSTRUCTION_DICT[instruction_id](instruction_id)
@@ -252,14 +228,22 @@ def summarize(rows, task):
             'unmasked_tokens_per_step': unmasked / steps,
             'mean_forward_steps': steps / len(subset),
             'mean_answer_tokens': sum(r['answer_tokens'] for r in subset) / len(subset),
+            'final_tokens_per_second': sum(r['final_unmasked_tokens'] for r in subset) / seconds,
+            'final_tokens_per_step': sum(r['final_unmasked_tokens'] for r in subset) / steps,
+            'answer_tokens_per_step': sum(r['answer_tokens'] for r in subset) / steps,
+            'remasked_tokens_total': sum(
+                sum(sum(c) for c in r['decoder_stats'].get('remasked_per_step', []))
+                for r in subset),
             'no_end_token_count': sum(not r['has_end_token'] for r in subset),
             'residual_mask_tokens': sum(r['residual_mask_tokens'] for r in subset),
             'peak_allocated_gib': max(r['peak_allocated_gib'] for r in subset),
         }
         if task == 'math500':
+            entry['correct'] = sum(r['correct'] for r in subset)
             entry['accuracy_percent'] = 100 * sum(r['correct'] for r in subset) / len(subset)
             entry['missing_boxed_count'] = sum(r['prediction'] is None for r in subset)
         elif task == 'mbpp':
+            entry['passed'] = sum(r['passed'] for r in subset)
             entry['pass_at_1_percent'] = 100 * sum(r['passed'] for r in subset) / len(subset)
             statuses = {}
             for r in subset:
@@ -270,8 +254,8 @@ def summarize(rows, task):
             entry.update({
                 'prompt_strict_accuracy_percent': 100 * sum(r['ifeval']['prompt_strict'] for r in subset) / len(subset),
                 'prompt_loose_accuracy_percent': 100 * sum(r['ifeval']['prompt_loose'] for r in subset) / len(subset),
-                'instruction_strict_accuracy_percent': 100 * sum(sum(r['ifeval']['strict_follow']) for r in subset) / n_inst,
-                'instruction_loose_accuracy_percent': 100 * sum(sum(r['ifeval']['loose_follow']) for r in subset) / n_inst,
+                'instruction_strict_accuracy_percent': 100 * sum(sum(r['ifeval']['strict_follow']) for r in subset) / n_inst if n_inst else 0.0,
+                'instruction_loose_accuracy_percent': 100 * sum(sum(r['ifeval']['loose_follow']) for r in subset) / n_inst if n_inst else 0.0,
             })
         if all('decoder_stats' in r for r in subset):
             entry['capped_incomplete_count'] = sum(r['decoder_stats'].get('capped_incomplete', False) for r in subset)
@@ -282,100 +266,323 @@ def summarize(rows, task):
     return summary
 
 
+
+
+def get_variants(args):
+    raw = (
+        json.loads(Path(args.variant_config).read_text(encoding='utf-8'))
+        if args.variant_config
+        else {name: {'decoder': name} for name in args.methods}
+    )
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError('variant-config must be a nonempty JSON object.')
+
+    variants = {}
+
+    for label, value in raw.items():
+        if not isinstance(value, dict):
+            raise ValueError(f'{label}: expected decoder options.')
+
+        options = dict(value)
+        decoder = options.pop('decoder', options.pop('remasking', label))
+        if decoder == 'confidence_pivot_v2':
+            decoder = 'ours'
+
+        if decoder == 'ours':
+            for key in (
+                'n', 'confidence_threshold', 'remask_k', 'remask_threshold',
+                'force_confidence',
+            ):
+                options.setdefault(key, getattr(args, key))
+
+            if args.n_switch_threshold is not None:
+                options.setdefault('n_switch_threshold', args.n_switch_threshold)
+
+            allowed = {
+                'n', 'confidence_threshold', 'remask_k', 'remask_threshold',
+                'logits_eos_inf', 'eos_token_id', 'n_switch_threshold',
+                'force_confidence',
+            }
+
+            integer_options = [('n', 1), ('remask_k', 0)]
+            if 'n_switch_threshold' in options:
+                integer_options.append(('n_switch_threshold', 0))
+            for key, minimum in integer_options:
+                value = options[key]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < minimum
+                ):
+                    raise ValueError(
+                        f'{label}: {key} must be an integer >= {minimum}.'
+                    )
+
+            for key in ('confidence_threshold', 'remask_threshold'):
+                if not 0 <= options[key] <= 1:
+                    raise ValueError(
+                        f'{label}: {key} must be between 0 and 1.'
+                    )
+
+        elif decoder in BASELINES:
+            allowed = baseline_options(decoder, args.model_family)
+
+        else:
+            raise ValueError(f'{label}: unsupported decoder {decoder!r}.')
+
+        if set(options) - allowed:
+            raise ValueError(
+                f'{label}: unsupported options {sorted(set(options) - allowed)}'
+            )
+
+        if decoder == 'ours':
+            parameters = inspect.signature(generate_ours).parameters
+            unsupported = set(options) - set(parameters)
+            if unsupported:
+                raise ValueError(f'{label}: current decoder does not accept {sorted(unsupported)}')
+        variants[label] = {'decoder': decoder, **options}
+
+    return variants
+
+def run_decoder(model, encoded, variant, args):
+    options = dict(variant)
+    decoder = options.pop('decoder')
+    mask_id = TOKEN_IDS[args.model_family]['mask_id']
+
+    if decoder == 'ours':
+        return generate_ours(
+            model, encoded['input_ids'],
+            gen_length=args.gen_length, block_length=args.block_length,
+            temperature=0.0, mask_id=mask_id, return_stats=True,
+            attention_mask=encoded.get('attention_mask'),
+            dream=args.model_family == 'dream', **options,
+        )
+
+    return run_baseline(
+        model, args.model_family, decoder, options,
+        encoded['input_ids'], encoded.get('attention_mask'),
+        mask_id=mask_id, gen_length=args.gen_length,
+        block_length=args.block_length, steps=args.steps,
+    )
+
+
+HF_TASKS = {
+    'math500': ('HuggingFaceH4/MATH-500', None, 'test', {'problem', 'answer', 'unique_id'}),
+    'mbpp': ('google-research-datasets/mbpp', 'full', 'test',
+             {'text', 'test_list', 'test_setup_code', 'task_id'}),
+    'ifeval': ('google/IFEval', None, 'train',
+               {'prompt', 'instruction_id_list', 'kwargs', 'key'}),
+}
+
+
+def load_data(args):
+    path = Path(args.dataset).expanduser()
+    if path.is_file():
+        data = Dataset.from_file(str(path))
+    else:
+        data = load_dataset(
+            args.dataset, args.dataset_config, split=args.dataset_split,
+            revision=args.dataset_revision, cache_dir=args.cache_dir,
+        )
+    missing = HF_TASKS[args.task][3] - set(data.column_names)
+    if missing:
+        raise ValueError(f'{args.task}: missing dataset columns {sorted(missing)}')
+    if not len(data):
+        raise ValueError('Dataset is empty.')
+    return data
+
+
+def select_indices(size, shard=None, limit=None):
+    indices = list(range(size))
+    if shard is not None:
+        try:
+            k, n = map(int, shard.split('/'))
+        except ValueError as exc:
+            raise ValueError('--shard must be k/n, for example 0/2.') from exc
+        if n <= 0 or not 0 <= k < n:
+            raise ValueError('--shard requires n > 0 and 0 <= k < n.')
+        indices = [i for i in indices if i % n == k]
+    if limit is not None:
+        if limit <= 0:
+            raise ValueError('--limit must be positive.')
+        indices = indices[:limit]
+    if not indices:
+        raise ValueError('No examples selected by this shard/limit.')
+    return indices
+
+
+def load_records(path, expected):
+    if not path.exists():
+        return [], set()
+    rows, done = [], set()
+    for line_number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f'Invalid results.jsonl line {line_number}; inspect an interrupted write.') from exc
+        key = (row['test_index'], row['mode'])
+        if key not in expected or key in done:
+            raise ValueError(f'Unexpected or duplicate result: {key}')
+        rows.append(row)
+        done.add(key)
+    return rows, done
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--task', required=True, choices=sorted(TASKS))
     parser.add_argument('--model', required=True)
-    parser.add_argument('--dataset', required=True, help='Cached Arrow file of the task split')
+    parser.add_argument('--model-family', choices=MODEL_FAMILIES, default='llada',
+                        help='dream: Dream-v0-Instruct-7B for the baselines (vanilla/hierarchy via '
+                             'dream_adapter, wino on the raw model, fastdllm via fastdllm_dream_decode); '
+                             'ours is LLaDA-only')
+    parser.add_argument('--dataset', help='HF dataset ID or local Arrow file; defaults by task')
+    parser.add_argument('--dataset-config')
+    parser.add_argument('--dataset-split')
+    parser.add_argument('--dataset-revision', default='main')
+    parser.add_argument('--cache-dir')
+    parser.add_argument('--model-revision')
+    parser.add_argument('--local-files-only', action='store_true',
+                        help='Use cached model/tokenizer files only; does not control datasets')
+    parser.add_argument('--native-cache-only', action='store_true',
+                        help='Skip the stock LLaDA cache-guard compatibility patch')
     parser.add_argument('--output', required=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gen-length', type=int, default=256)
     parser.add_argument('--block-length', type=int, default=32)
-    parser.add_argument('--steps', type=int, default=256)
+    parser.add_argument('--steps', type=int, default=256, help='Baseline only; ignored by ours')
     parser.add_argument('--exec-timeout', type=float, default=10.0)
-    parser.add_argument('--limit', type=int, default=None, help='Evaluate only the first N tasks (debug)')
-    parser.add_argument('--shard', default=None, help='k/n: evaluate indices with index %% n == k')
-    parser.add_argument('--model-family', choices=('llada', 'dream'), default='llada',
-                        help='dream: Dream-v0-Instruct-7B via dream_adapter (shifted logits, full attention)')
-    parser.add_argument('--variant-config', required=True,
-                        help='JSON mapping experiment labels to generate keyword arguments')
+    parser.add_argument('--limit', type=int, help='First N selected examples, after sharding')
+    parser.add_argument('--shard', help='k/n; use a separate output directory per shard')
+    parser.add_argument('--methods', nargs='+', default=['ours'], choices=DECODERS)
+    parser.add_argument('--n', type=int, default=1)
+    parser.add_argument('--confidence-threshold', type=float, default=0.9)
+    parser.add_argument('--remask-k', type=int, default=0)
+    parser.add_argument('--remask-threshold', type=float, default=0.5)
+    parser.add_argument('--force-confidence', type=float, default=None,
+                        help='Always unmask tokens whose bf16 confidence >= this value (None disables)')
+    parser.add_argument('--n-switch-threshold', type=int, default=None,
+                        help='Omit to use the current decoder default, if it has this schedule')
+    parser.add_argument('--variant-config', help='Optional JSON; decoder/remasking aliases supported')
     args = parser.parse_args()
+
+    if args.gen_length <= 0 or args.block_length <= 0 or args.gen_length % args.block_length:
+        parser.error('--gen-length must be positive and divisible by --block-length.')
+    if not math.isfinite(args.exec_timeout) or args.exec_timeout <= 0:
+        parser.error('--exec-timeout must be finite and positive.')
+    dataset_id, dataset_config, dataset_split, _ = HF_TASKS[args.task]
+    if args.dataset is None:
+        args.dataset = dataset_id
+    if args.dataset_config is None and args.dataset == dataset_id:
+        args.dataset_config = dataset_config
+    if args.dataset_split is None:
+        args.dataset_split = dataset_split
+    variants = get_variants(args)
+    loader = resolve_loader(variants, args.model_family)
+    blocks = args.gen_length // args.block_length
+    if any(v['decoder'] in ('low_confidence', 'random') for v in variants.values()):
+        if args.steps < blocks or args.steps % blocks:
+            parser.error('--steps must be positive and divisible by the number of blocks.')
+
+    dataset = load_data(args)
+    indices = select_indices(len(dataset), args.shard, args.limit)
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is unavailable; this benchmark requires a GPU.')
+    task = TASKS[args.task]
     out_dir = Path(args.output).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    task = TASKS[args.task]
-    dataset = Dataset.from_file(args.dataset)
-    indices = list(range(len(dataset)))
-    if args.shard:
-        k, n = (int(v) for v in args.shard.split('/'))
-        indices = [i for i in indices if i % n == k]
-    indices = indices[:args.limit]
-    variants = json.loads(Path(args.variant_config).read_text())
-    for label, kwargs in variants.items():
-        if not isinstance(kwargs, dict) or 'remasking' not in kwargs:
-            raise ValueError(f'{label}: specify generate keyword arguments including remasking.')
+    sources = [Path(__file__).resolve()]
+    if any(v['decoder'] == 'ours' for v in variants.values()):
+        sources.append(Path(inspect.getfile(inspect.unwrap(generate_ours))).resolve())
+    sources.extend(source_files(variants, args.model_family))
+    ifeval_sources = []
+    if args.task == 'ifeval':
+        try:
+            from ifeval_lib import instructions_registry
+        except ImportError as exc:
+            raise RuntimeError(
+                'IFEval requires the original ifeval_lib/ package and its dependencies '
+                'beside this script. HF downloads the dataset, not the checker. '
+                f'Import error: {exc}'
+            ) from exc
+        checker_dir = Path(instructions_registry.__file__).resolve().parent
+        ifeval_sources = sorted(checker_dir.rglob('*.py'))
+        checker_hashes = {
+            str(p.relative_to(checker_dir)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in ifeval_sources
+        }
     modes_to_run = tuple(variants)
     config = vars(args).copy()
+    config['cli_decoder_defaults'] = {
+        key: config.pop(key) for key in (
+            'n', 'confidence_threshold', 'remask_k', 'remask_threshold', 'n_switch_threshold',
+            'force_confidence')
+    }
     config.update({
-        'model_revision': Path(args.model).name,
-        'num_tasks': len(indices), 'batch_size': 1, 'num_fewshot': 0,
-        'variants': variants,
-        **({'model_family': args.model_family} if args.model_family != 'llada' else {}),
+        'model_family': args.model_family, 'model_loader': loader,
+        'num_tasks': len(indices), 'test_indices': indices,
+        'dataset_fingerprint': getattr(dataset, '_fingerprint', None),
+        'batch_size': 1, 'num_fewshot': 0, 'variants': variants,
+        'decoder_signature': str(inspect.signature(generate_ours)),
         'temperature': 0, 'cfg_scale': 0, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(0),
         'torch': torch.__version__, 'transformers': transformers.__version__,
         'prompt_suffix': task['suffix'],
-        'decode_sha256': hashlib.sha256(Path(__file__).with_name('decode.py').read_bytes()).hexdigest(),
-        'hierarchy_decode_sha256': hashlib.sha256(Path(__file__).with_name('hierarchy_decode.py').read_bytes()).hexdigest(),
-        'decode_confidence_v2_sha256': hashlib.sha256(Path(__file__).with_name('decode_confidence_v2.py').read_bytes()).hexdigest(),
-        'wino_decode_sha256': hashlib.sha256(Path(__file__).with_name('wino_decode.py').read_bytes()).hexdigest(),
-        'fastdllm_decode_sha256': hashlib.sha256(Path(__file__).with_name('fastdllm_decode.py').read_bytes()).hexdigest(),
-        'eval_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'source_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
         'metrics': {
-            'timing': 'CUDA-synchronized wall time around generate; excludes tokenization, loading, warmup, and scoring.',
-            'tokens_per_second': 'Actual unmasked positions including special tokens and post-EOS positions / decode seconds.',
+            'timing': 'CUDA-synchronized generate time; excludes loading, tokenization, warmup and scoring.',
+            'tokens_per_second': 'Gross unmask events, including refills and special/post-EOS tokens / decode seconds.',
+            'final_tokens_per_second': 'Final non-MASK generated positions, including special/post-EOS tokens / decode seconds.',
             'answer_tokens_per_second': 'Non-special tokens before first EOS/EOT / decode seconds.',
-            'tokens_per_step': 'Actual unmasked positions / forward calls, batch size 1.',
+            'math500': 'Normalized last boxed answer plus numeric tolerance 1e-6; not symbolic equivalence.',
+            'mbpp': 'Generated code plus test_setup_code and visible test_list, subprocess timeout.',
+            'ifeval': 'Original ifeval_lib checkers; prompt/instruction strict and loose scores.',
         },
     })
+    if args.task == 'ifeval':
+        config['ifeval_checker_sha256'] = checker_hashes
     config_path = out_dir / 'config.json'
     if config_path.exists() and json.loads(config_path.read_text()) != config:
         raise ValueError('Existing output has a different configuration; use a new output directory.')
     write_json(config_path, config)
     source_dir = out_dir / 'source'
     source_dir.mkdir(exist_ok=True)
-    for filename in ('decode.py', 'hierarchy_decode.py', 'decode_confidence_v2.py', 'wino_decode.py', 'fastdllm_decode.py', Path(__file__).name):
-        (source_dir / filename).write_bytes(Path(__file__).with_name(filename).read_bytes())
+    for path in sources:
+        (source_dir / path.name).write_bytes(path.read_bytes())
+    for path in ifeval_sources:
+        dest = source_dir / 'ifeval_lib' / path.relative_to(checker_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(path.read_bytes())
+    write_json(out_dir / 'samples.json', [{'test_index': i, **dataset[i]} for i in indices])
     workdir = out_dir / 'exec_tmp'
     workdir.mkdir(exist_ok=True)
     records_path = out_dir / 'results.jsonl'
-    rows = [json.loads(line) for line in records_path.read_text().splitlines()] if records_path.exists() else []
-    done = {(r['test_index'], r['mode']) for r in rows}
-    if len(done) == len(indices) * len(modes_to_run):
-        print(json.dumps(summarize(rows, args.task), indent=2), flush=True)
+    expected = {(i, mode) for i in indices for mode in variants}
+    rows, done = load_records(records_path, expected)
+    if done == expected:
+        summary = summarize(rows, args.task)
+        write_json(out_dir / 'summary.json', summary)
+        print(json.dumps(summary, indent=2), flush=True)
         return
-    print(f'Loading {args.model} on {config["gpu"]}', flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
-    uses_wino = any(v['remasking'] == 'wino' for v in variants.values())
-    uses_fastdllm = any(v['remasking'] == 'fastdllm' or v.get('prefix_cache') for v in variants.values())
-    if uses_fastdllm and (uses_wino or args.model_family == 'dream'):
-        raise ValueError('fastdllm needs its own LLaDA modeling: run it alone, on --model-family llada.')
-    if args.model_family == 'dream':
-        model = load_dream_model(args.model)
-        mask_id, end_ids = DREAM_MASK_ID, set(DREAM_END_IDS)
-    else:
-        if uses_wino:
-            model = load_wino_model(args.model)
-        elif uses_fastdllm:
-            model = load_fastdllm_model(args.model)
-        else:
-            model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
-                                            local_files_only=True, torch_dtype=torch.bfloat16).to('cuda').eval()
-        mask_id, end_ids = 126336, {126081, 126348}
-    eos = tokenizer.eos_token_id
-    if eos is not None:
-        end_ids.add(eos)
+
+    pretrained = dict(trust_remote_code=True, local_files_only=args.local_files_only)
+    if args.cache_dir is not None:
+        pretrained['cache_dir'] = args.cache_dir
+    if args.model_revision is not None:
+        pretrained['revision'] = args.model_revision
+    print(f'Loading {args.model}; variants={json.dumps(variants)}', flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **pretrained)
+    model = load_model(args.model, loader, pretrained)
+    print(f'Model family: {args.model_family}; loader: {loader}', flush=True)
+    if (loader == 'hf' and any(v['decoder'] == 'ours' for v in variants.values())
+            and not args.native_cache_only):
+        print('Cache preparation: ' + prepare_prefix_cache(model), flush=True)
+    ids = TOKEN_IDS[args.model_family]
+    mask_id, end_ids = ids['mask_id'], set(ids['end_ids'])
+    if tokenizer.eos_token_id is not None:
+        end_ids.add(tokenizer.eos_token_id)
     special_ids = set(tokenizer.all_special_ids) | end_ids | {mask_id}
 
     def encode(question):
@@ -384,22 +591,7 @@ def main():
         return tokenizer(text, add_special_tokens=False, return_tensors='pt').to('cuda')
 
     def run(encoded, mode):
-        kwargs = dict(variants[mode])
-        remasking = kwargs.pop('remasking')
-        decoder = {'hierarchy': generate_hierarchy,
-                   'confidence_pivot_v2': generate_confidence_pivot_v2,
-                   'wino': generate_wino,
-                   'fastdllm': generate_fastdllm}.get(remasking, generate)
-        target = model
-        if decoder is generate_wino and args.model_family == 'dream':
-            target, kwargs['dream'] = model.model, True  # raw Dream model; shadow-slot shift handled inside
-        if decoder is generate:
-            kwargs['remasking'] = remasking
-        return decoder(target, encoded['input_ids'],
-                       attention_mask=encoded['attention_mask'] if args.model_family == 'llada' else None,
-                       mask_id=mask_id,
-                       gen_length=args.gen_length, block_length=args.block_length, steps=args.steps,
-                       temperature=0, cfg_scale=0, return_stats=True, **kwargs)
+        return run_decoder(model, encoded, variants[mode], args)
 
     warmup = encode(task['warmup'])
     for mode in modes_to_run:
@@ -434,6 +626,7 @@ def main():
                     'test_index': index, 'mode': mode, 'seed': sample_seed,
                     'text': text, 'raw_text': tokenizer.decode(generated, skip_special_tokens=False),
                     'has_end_token': end < len(generated),
+                    'reached_generation_limit_without_end': end == len(generated) and len(generated) >= args.gen_length,
                     'generated_ids': generated, 'prompt_tokens': encoded['input_ids'].shape[1],
                     'answer_tokens': sum(token not in special_ids for token in generated[:end]),
                     'unmasked_tokens': sum(counts), 'unmasked_per_step': counts,
@@ -469,8 +662,8 @@ def main():
                 write_json(out_dir / 'summary.json', summarize(rows, args.task))
                 print(f'[{len(done)}/{len(indices) * len(modes_to_run)}] index={index} {mode}: {score} '
                       f'steps={row["forward_steps"]} time={elapsed:.2f}s '
-                      f'tokens/s={row["unmasked_tokens"]/elapsed:.2f} '
-                      f'tokens/step={row["unmasked_tokens"]/row["forward_steps"]:.2f}', flush=True)
+                      f'answer_tokens/s={row["answer_tokens"]/elapsed:.2f} '
+                      f'final_tokens/s={row["final_unmasked_tokens"]/elapsed:.2f}', flush=True)
                 del tokens
     print('COMPLETE\n' + json.dumps(summarize(rows, args.task), indent=2), flush=True)
 

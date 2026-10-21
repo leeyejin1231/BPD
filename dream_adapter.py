@@ -1,15 +1,3 @@
-"""Run the LLaDA-style decoders on Dream-v0-Instruct-7B without changing them.
-
-Dream differs from LLaDA in two ways that matter to the decoders in this repo:
-  * its forward wants attention_mask="full" (or a 4-D boolean mask) rather than a 2-D
-    padding mask, and
-  * it predicts the token at position i from the logits at position i-1, so its own
-    sampler shifts logits right by one (generation_utils.DreamGenerationMixin._sample).
-DreamForwardAdapter wraps the model so that `adapter(x, attention_mask=None).logits`
-returns already-shifted logits over a fully bidirectional forward. Batch size 1 only
-(no padding), which is what every evaluator here uses. Token ids: mask 151666,
-end-of-turn 151645 (<|im_end|>), eos/pad 151643 (<|endoftext|>).
-"""
 from types import SimpleNamespace
 
 import torch
@@ -43,6 +31,5 @@ class DreamForwardAdapter:
 
 
 def load_model(path, device='cuda'):
-    model = AutoModel.from_pretrained(path, trust_remote_code=True, local_files_only=True,
-                                      torch_dtype=torch.bfloat16).to(device).eval()
+    model = AutoModel.from_pretrained(path, trust_remote_code=True, local_files_only=True, torch_dtype=torch.bfloat16).to(device).eval()
     return DreamForwardAdapter(model)

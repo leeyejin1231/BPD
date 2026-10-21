@@ -2,15 +2,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-from transformers import AutoTokenizer, AutoModel
-
 
 def add_gumbel_noise(logits, temperature):
-    '''
-    The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-    Thus, we use float64.
-    '''
     if temperature == 0:
         return logits
     logits = logits.to(torch.float64)
@@ -20,13 +13,6 @@ def add_gumbel_noise(logits, temperature):
 
 
 def get_num_transfer_tokens(mask_index, steps):
-    '''
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-    '''
     mask_num = mask_index.sum(dim=1, keepdim=True)
 
     base = mask_num // steps
@@ -41,12 +27,6 @@ def get_num_transfer_tokens(mask_index, steps):
 
 
 def get_random_pivot_transfer_index(x, intervals, balanced=False):
-    """Select one uniform pivot per half-open interval, independently per sample.
-
-    Keep interval bookkeeping and position sampling on CPU to avoid a GPU
-    synchronization for each pivot. Sampling follows torch.manual_seed().
-    Children become eligible on the next forward pass.
-    """
     transfer_index = torch.zeros_like(x, dtype=torch.bool)
     next_intervals = []
     for batch_index, sample_intervals in enumerate(intervals):
@@ -66,16 +46,7 @@ def get_random_pivot_transfer_index(x, intervals, balanced=False):
     return transfer_index, next_intervals
 
 
-def select_confident_pivots(x, intervals, confidence, block_start, retries,
-                           use_confidence=False, threshold=None, max_retries=3,
-                           balanced=False):
-    """Select/accept pivots, retaining a rejected interval without splitting it.
-
-    confidence contains FP32 probabilities for predicted tokens in this block.
-    Copy this small matrix once instead of synchronizing once per interval.
-    Rejection counts belong to intervals; each accepted pivot's children start
-    with zero rejections. A fallback selects the most confident position.
-    """
+def select_confident_pivots(x, intervals, confidence, block_start, retries, use_confidence=False, threshold=None, max_retries=3, balanced=False):
     scores = confidence.detach().cpu()
     transfer_index = torch.zeros_like(x, dtype=torch.bool)
     next_intervals, next_retries = [], {}
@@ -131,7 +102,6 @@ def get_next_sequence_token_id(tokens, position, sequence, context_start):
 def apply_end_think_logit_boost(logits, tokens, candidate_mask_index, context_start,
                                 total_gen_length, end_think_token_ids=None,
                                 end_think_logit_boost=0., end_think_boost_power=2.):
-    """Gradually encourage an end-of-thinking token sequence during generation."""
     if end_think_logit_boost <= 0 or not end_think_token_ids or total_gen_length <= 0:
         return logits
     if any(token_id < 0 or token_id >= logits.shape[-1] for token_id in end_think_token_ids):
@@ -171,32 +141,6 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              pivot_balanced_steps=0, pivot_confidence_steps=0,
              pivot_confidence_threshold=None, pivot_max_retries=3,
              pivot_max_block_steps=None):
-    '''
-    Args:
-        model: Mask predictor.
-        prompt: A tensor of shape (1, L).
-        steps: Sampling steps, less than or equal to gen_length. Ignored for random_pivot.
-        gen_length: Generated answer length.
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        temperature: Categorical distribution sampling temperature.
-        cfg_scale: Unsupervised classifier-free guidance scale.
-        remasking: 'low_confidence', 'random', or 'random_pivot'. random_pivot
-            simultaneously unmasks one random position per non-empty interval
-            and recursively splits each interval until the block is complete.
-        mask_id: The toke id of [MASK] is 126336.
-        logits_eos_inf: Whether to set the logits of EOS token to -inf. See Appendix B.4 of LLaDA for details
-        confidence_eos_eot_inf: Whether to set the confidence of EOS and EoT token to -inf. See Appendix B.4 of LLaDA for details
-        return_stats: Return (tokens, stats) with actual unmask counts per forward.
-        pivot_balanced_steps: First K steps of EACH block sample from its
-            intervals' central half (trim floor(length/4) positions at each end).
-        pivot_confidence_steps: First K steps of EACH block select the highest
-            predicted-token probability position in each interval.
-        pivot_confidence_threshold: Defer pivots with probability <= threshold.
-        pivot_max_retries: After this many interval rejections, select and commit
-            its most confident token. None disables forced acceptance.
-        pivot_max_block_steps: Optional hard cap. A capped incomplete block ends
-            generation immediately with residual MASKs, reported in stats.
-    '''
     if pivot_balanced_steps < 0 or pivot_confidence_steps < 0:
         raise ValueError('Initial pivot step counts must be non-negative.')
     if pivot_confidence_threshold is not None and not 0 <= pivot_confidence_threshold <= 1:
@@ -269,13 +213,14 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
+                attention_mask_ = None
                 if attention_mask is not None:
                     attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                logits = model(x_, attention_mask=attention_mask_).logits
+                logits = model(x_, attention_mask=attention_mask_, use_cache=False).logits
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
-                logits = model(x, attention_mask=attention_mask).logits
+                logits = model(x, attention_mask=attention_mask, use_cache=False).logits
 
             logits = apply_end_think_logit_boost(
                 logits,
@@ -361,71 +306,3 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             stats['capped_incomplete'] = capped_incomplete
         return x, stats
     return x
-
-
-@torch.no_grad()
-def var_generate(model, tokenizer, prompt, steps, gen_length, block_length,
-                 temperature=0., cfg_scale=0., remasking='low_confidence',
-                 mask_id=5, stop_tokens=None, end_think_token_ids=None,
-                 end_think_logit_boost=0., end_think_boost_power=2.):
-    """Generate one block at a time without adding future mask blocks."""
-    assert gen_length % block_length == 0
-
-    x = prompt.clone()
-    stop_tokens = stop_tokens or []
-    for _ in range(gen_length // block_length):
-        x = generate(
-            model, x, steps=steps, gen_length=block_length,
-            block_length=block_length, temperature=temperature,
-            cfg_scale=cfg_scale, remasking=remasking, mask_id=mask_id,
-            end_think_token_ids=end_think_token_ids,
-            end_think_logit_boost=end_think_logit_boost,
-            end_think_boost_power=end_think_boost_power,
-            end_think_context_start=prompt.shape[1],
-            end_think_total_gen_length=gen_length,
-        )
-        text = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
-        if any(stop_token in text for stop_token in stop_tokens):
-            break
-    return x
-
-
-def main():
-    device = 'cuda'
-
-    model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-
-    # The LLaDA architecture theoretically supports both left-padding and right-padding. 
-    # However, the sampling code implementation is simpler with left-padding.
-    if tokenizer.padding_side != 'left':
-        tokenizer.padding_side = 'left'
-
-    # If the padding ID equals the mask ID, you need to modify our generate function to achieve correct inference.
-    assert tokenizer.pad_token_id != 126336
-
-    prompts = [ "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?",
-             "Joy can read 8 pages of a book in 20 minutes. How many hours will it take her to read 120 pages?",
-             "Randy has 60 mango trees on his farm. He also has 5 less than half as many coconut trees as mango trees. How many trees does Randy have in all on his farm?"]
-
-    # Add special tokens for the Instruct model. The Base model does not require the following two lines.
-    messages = [{"role": "user", "content": prompt} for prompt in prompts]
-    prompts = [tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) for message in messages]
-
-    encoded_outputs = tokenizer(
-        prompts,
-        add_special_tokens=False,
-        padding=True,
-        return_tensors="pt"
-    )
-    input_ids = encoded_outputs['input_ids'].to(device)
-    attention_mask = encoded_outputs['attention_mask'].to(device)
-
-    out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0., remasking='random_pivot')
-    output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-    for o in output:
-        print(o)
-        print('-' * 50)
-
-if __name__ == '__main__':
-    main()
