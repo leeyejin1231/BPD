@@ -2,13 +2,13 @@
 
 Two model families, selected with --model-family:
   * llada (GSAI-ML/LLaDA-8B-Instruct): ours runs on the stock HF model with the prefix KV
-    cache (decode_confidence_v2.prepare_prefix_cache); vanilla (decode.py) and Hierarchy-dLLM
-    (hierarchy_decode.py) share that model. WINO needs WINO's modeling_llada (4-D attention
+    cache (decode_confidence_v2.prepare_prefix_cache); vanilla (decode.py), Hierarchy-dLLM
+    (hierarchy_decode.py), the bisection samplers (bisection/decode_bisection.py) and DAPD (dapd_decode.py) share that model. WINO needs WINO's modeling_llada (4-D attention
     mask, position ids) and Fast-dLLM needs Fast-dLLM's modeling_llada (KV cache), so each of
     them runs alone, in its own process.
-  * dream (Dream-org/Dream-v0-Instruct-7B): vanilla and Hierarchy-dLLM run through
+  * dream (Dream-org/Dream-v0-Instruct-7B): vanilla, Hierarchy-dLLM and bisection run through
     dream_adapter.DreamForwardAdapter (logits shifted right by one, attention_mask="full");
-    WINO takes the raw Dream model with dream=True (wino_decode.py); Fast-dLLM uses
+    WINO and DAPD take the raw Dream model with dream=True (wino_decode.py, dapd_decode.py); Fast-dLLM uses
     Fast-dLLM's modeling_dream through fastdllm_dream_decode.py (prefix cache) and runs alone.
     ours runs on the Fast-dLLM Dream modeling too (decode_confidence_v2.generate(dream=True)).
 Token ids: LLaDA mask 126336, end {126081, 126348}; Dream mask 151666, end {151643, 151645}.
@@ -24,7 +24,7 @@ from dream_adapter import END_IDS as DREAM_END_IDS, MASK_ID as DREAM_MASK_ID
 
 MODEL_FAMILIES = ('llada', 'dream')
 VANILLA = ('low_confidence', 'random', 'random_pivot')
-BASELINES = VANILLA + ('hierarchy', 'wino', 'fastdllm')
+BASELINES = VANILLA + ('hierarchy', 'bisection', 'dapd', 'wino', 'fastdllm')
 DECODERS = ('ours',) + BASELINES
 EXCLUSIVE = ('wino', 'fastdllm')  # own modeling files: one of them per process, nothing else
 TOKEN_IDS = {
@@ -42,6 +42,10 @@ def baseline_generate(decoder, model_family):
         from decode import generate
     elif decoder == 'hierarchy':
         from hierarchy_decode import generate_hierarchy as generate
+    elif decoder == 'bisection':
+        from bisection.decode_bisection import generate
+    elif decoder == 'dapd':
+        from dapd_decode import generate
     elif decoder == 'wino':
         from wino_decode import generate
     elif decoder == 'fastdllm':
@@ -126,7 +130,7 @@ def run_baseline(model, model_family, decoder, options, input_ids, attention_mas
     target, options = model, dict(options)
     if model_family == 'dream':
         attention_mask = None  # unpadded batch of 1; the adapter and the ports insist on it
-        if decoder == 'wino':
+        if decoder in ('wino', 'dapd'):
             target, options['dream'] = model.model, True  # raw Dream model; shadow-slot shift inside
     kwargs = dict(gen_length=gen_length, block_length=block_length, temperature=0.0,
                   mask_id=mask_id, return_stats=True, attention_mask=attention_mask)

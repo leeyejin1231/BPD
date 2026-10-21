@@ -21,6 +21,7 @@ git clone https://github.com/inclusionAI/dInfer.git
 |---|---|---|
 | `low_confidence` / `random` / `random_pivot` (vanilla, `decode.py`) | HF model | `dream_adapter` (shifted logits, full attention) |
 | `hierarchy` (`hierarchy_decode.py`) | HF model | `dream_adapter` |
+| `bisection` (`bisection/decode_bisection.py`, arXiv:2606.22976, `k` / `score`) | HF model | `dream_adapter` |
 | `wino` (`wino_decode.py`) | WINO `modeling_llada`, alone | raw Dream model, `dream=True`, alone |
 | `fastdllm` | Fast-dLLM `modeling_llada`, alone | `fastdllm_dream_decode.py` (Fast-dLLM `modeling_dream`, prefix cache), alone |
 | `ours` (`decode_confidence_v2.py`) | HF model + prefix KV cache | not ported |

@@ -33,6 +33,12 @@ logs/
 ifeval_lib/
 configs/
 Fast-dLLM/
+DAPD/
+configs/
+bisection/
+legacy/
+
+
 
 METHOD.md
 
