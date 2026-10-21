@@ -1,20 +1,3 @@
-"""Fast-dLLM baseline on Dream-v0-Instruct-7B, ported from Fast-dLLM/v1/dream/model/generation_utils_block.py.
-
-The loop is DreamGenerationMixin._sample with alg='confidence_threshold' and the prefix KV
-cache (use_cache=true, dual_cache=false), the setting Fast-dLLM's Dream scripts call
-"prefix cache+parallel", written out with per-step accounting:
-  * every block starts with a full forward whose keys/values before the block are kept;
-    Fast-dLLM also commits the first position of the block from that forward (Dream
-    predicts position i from the logits at i-1, so the shifted logits are used throughout);
-  * later steps recompute the block and the suffix with the cached prefix and commit every
-    masked position of the block with confidence >= threshold, plus the single most
-    confident one.
-sample_tokens is imported unchanged (temperature 0: argmax and its probability). The
-cache needs past_key_values, which the Hugging Face Dream modeling does not accept, so
-load_model() builds the model with Fast-dLLM's modeling_dream.py (same weights). The
-model is used directly, not through dream_adapter. Batch size 1; a cached forward counts
-as one forward step. Token ids follow dream_adapter (mask 151666).
-"""
 import importlib.util
 import sys
 from pathlib import Path
@@ -35,7 +18,6 @@ def _load(name, path, package=False):
 
 
 def _model_package():
-    """Fast-dLLM's dream/model package under a private name (its modules use relative imports)."""
     return _load('fastdllm_dream_model', FAST_DIR / '__init__.py', package=True)
 
 
@@ -55,7 +37,6 @@ def _shift(logits):
 @torch.no_grad()
 def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32, temperature=0.,
              mask_id=151666, threshold=0.9, cache='prefix', return_stats=False, **unused):
-    """Fast-dLLM confidence-threshold decoding on Dream with per-step accounting; unused absorbs steps/cfg_scale."""
     if unused.get('cfg_scale', 0):
         raise NotImplementedError('CFG is not part of the Fast-dLLM baseline.')
     if attention_mask is not None:
@@ -83,8 +64,7 @@ def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32
 
         while (x[:, s:e] == mask_id).any():
             mask_index = x[:, s:] == mask_id
-            logits = _shift(model(x[:, s:], attention_mask='full', position_ids=None,
-                                  past_key_values=past_key_values, use_cache=True).logits)
+            logits = _shift(model(x[:, s:], attention_mask='full', position_ids=None, past_key_values=past_key_values, use_cache=True).logits)
             confidence, x0 = sample_tokens(logits[mask_index], temperature=temperature)
             x_ = torch.full_like(x[:, s:], mask_id)
             full_confidence = torch.full_like(x[:, s:], -torch.inf, dtype=logits.dtype)

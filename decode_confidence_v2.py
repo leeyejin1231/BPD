@@ -1,4 +1,3 @@
-"""Confidence pivots with a fixed prefix KV cache, refreshed at every block."""
 import ast
 import inspect
 import math
@@ -9,12 +8,6 @@ import torch
 
 
 def prepare_prefix_cache(model):
-    """Enable the existing cache implementation in stock HF LLaDA, if needed.
-
-    Only the known cache prohibition is removed, on this model instance.
-    Weights, attention, RoPE, and use_cache=False behavior are unchanged.
-    Models already supporting caching are left alone. No disk files are edited.
-    """
     core = getattr(model, 'model', None)
     if core is None or type(core).__name__ != 'LLaDAModel':
         return 'native'
@@ -28,8 +21,7 @@ def prepare_prefix_cache(model):
     tree = ast.parse(source)
     function = tree.body[0]
     expected = ast.dump(ast.parse('past_key_values is None and not use_cache', mode='eval').body)
-    guards = [node for node in function.body if isinstance(node, ast.Assert)
-              and ast.dump(node.test) == expected]
+    guards = [node for node in function.body if isinstance(node, ast.Assert) and ast.dump(node.test) == expected]
     if not guards:
         return 'native'
     if (len(guards) != 1 or core.config.alibi or not core.config.rope
@@ -40,8 +32,7 @@ def prepare_prefix_cache(model):
     function.decorator_list = []
     # Compile inside a class to preserve Python's private-name mangling (__cache).
     wrapper = ast.ClassDef(name='LLaDAModel', bases=[], keywords=[], body=[function], decorator_list=[])
-    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
-                              wrapper], type_ignores=[])
+    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), wrapper], type_ignores=[])
     namespace = dict(method.__func__.__globals__)
     exec(compile(ast.fix_missing_locations(module), '<llada-prefix-cache>', 'exec'), namespace)
     core.forward = types.MethodType(namespace['LLaDAModel'].forward, core)
@@ -65,7 +56,6 @@ def _prefix_only(cache, length):
 
 
 def _dream_prefix_only(cache, length):
-    """Prefix slice of Fast-dLLM's Dream cache: one (key, value) pair per layer, [B, S, hidden]."""
     if not isinstance(cache, (tuple, list)) or not cache:
         raise RuntimeError('dream=True requires Fast-dLLM Dream modeling returning (key, value) tuples.')
     result = []
@@ -109,18 +99,6 @@ def generate(
     force_confidence=None,
     dream=False,
 ):
-    """Fill each MASK interval, then optionally remask across the current block.
-
-    dream=True delegates to decode_confidence_v2_dream.generate: Fast-dLLM's Dream
-    block/cache mechanics (full forward per block that commits position 0, shifted
-    logits, bf16 sample_tokens) with this file's selection policy. eos_token_id defaults
-    to 126081 (LLaDA) or 151643 (Dream).
-
-    On incomplete steps, remask up to remask_k committed tokens with the lowest
-    P(current token) strictly below remask_threshold. Newly committed tokens are
-    eligible too. Scores come from the SAME pre-update forward (no extra forward).
-    Completed blocks exit before remasking. remask_k=0 disables this policy.
-    """
     if dream:
         from decode_confidence_v2_dream import generate as generate_dream
         return generate_dream(
@@ -195,8 +173,7 @@ def generate(
                         getattr(output, 'past_key_values', None), block_start - 1)
                     prefill_steps += 1
                 else:
-                    output = model(x[:, block_start - 1:], attention_mask='full', position_ids=None,
-                                   past_key_values=past_key_values, use_cache=True)
+                    output = model(x[:, block_start - 1:], attention_mask='full', position_ids=None, past_key_values=past_key_values, use_cache=True)
                     logits = output.logits[0, :block_length].float()
                     cached_steps += 1
             elif past_key_values is None:

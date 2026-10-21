@@ -1,9 +1,3 @@
-"""Resumable GSM8K evaluation for LLaDA or Dream using Hugging Face datasets.
-
-Decoders: ours (decode_confidence_v2.py, LLaDA only) and the baselines low_confidence /
-random / random_pivot (decode.py), hierarchy, wino and fastdllm; see eval_models.py for the
-model implementation each one needs and for --model-family dream.
-"""
 import argparse
 import hashlib
 import json

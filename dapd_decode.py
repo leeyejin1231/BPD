@@ -1,4 +1,3 @@
-"""DAPD (Kim, Jeon, Jeon, No, arXiv:2603.12996) as a baseline decoder: the official dapd package cloned in DAPD/, block-wise selection on the stock HF LLaDA model (generate_dapd_with_blocks) or, with dream=True, on the raw Dream model (dream_generate_dapd_with_blocks hooks Dream's attention layers and shifts the logits itself), stats converted to the harness format."""
 import sys
 from pathlib import Path
 from types import SimpleNamespace

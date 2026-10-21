@@ -1,19 +1,3 @@
-"""Fast-dLLM baseline (Wu et al., ICLR 2026), ported from Fast-dLLM/v1/llada/generate.py.
-
-Confidence-aware parallel decoding: every step commits all masked tokens of the current
-block with confidence >= threshold, plus the single most confident one. cache selects the
-KV-cache variant of the original code:
-  * None     -> generate(): full forward every step (parallel decoding only).
-  * 'prefix' -> generate_with_prefix_cache(): one full forward per block caches the prefix;
-                later steps recompute the current block and the suffix.
-  * 'dual'   -> generate_with_dual_cache(): prefix and suffix are cached; later steps
-                recompute only the current block (replace_position).
-The token-selection rule is Fast-dLLM's own get_transfer_index, imported unchanged. The
-cache needs past_key_values/replace_position, which the Hugging Face LLaDA modeling does
-not accept, so load_model() builds the model with Fast-dLLM's modeling_llada.py (same
-weights). Each block runs until it has no [MASK], i.e. the original loops with
-steps = gen_length. Batch size 1; a cached forward counts as one forward step.
-"""
 import importlib.util
 import sys
 from pathlib import Path
@@ -24,7 +8,6 @@ FAST_DIR = Path(__file__).resolve().parent / 'Fast-dLLM' / 'v1' / 'llada'
 
 
 def _original():
-    """Fast-dLLM's generate.py, loaded under a private name (it imports its own model package)."""
     if 'fastdllm_generate' not in sys.modules:
         if str(FAST_DIR) not in sys.path:
             sys.path.insert(0, str(FAST_DIR))
@@ -43,7 +26,6 @@ def load_model(path, device='cuda'):
 @torch.no_grad()
 def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32, temperature=0.,
              mask_id=126336, threshold=0.9, cache=None, return_stats=False, **unused):
-    """Fast-dLLM threshold decoding with per-step accounting; unused absorbs steps/cfg_scale."""
     if unused.get('cfg_scale', 0):
         raise NotImplementedError('CFG is not part of the Fast-dLLM baseline.')
     if prompt.shape[0] != 1:
@@ -96,8 +78,7 @@ def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32
             replace_position = torch.zeros_like(x, dtype=torch.bool)
             replace_position[:, s:e] = True
             while (x[:, s:e] == mask_id).any():
-                logits = model(x[:, s:e], past_key_values=past_key_values, use_cache=True,
-                               replace_position=replace_position).logits
+                logits = model(x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position).logits
                 mask_index = (x[:, s:e] == mask_id)
                 x0, transfer_index = select(logits, mask_index, x[:, s:e])
                 x[:, s:e] = torch.where(transfer_index, x0, x[:, s:e])

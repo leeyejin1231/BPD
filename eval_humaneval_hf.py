@@ -1,12 +1,3 @@
-"""Resumable HumanEval for LLaDA or Dream: ours by default, optional baselines.
-
-Baselines: low_confidence / random / random_pivot (decode.py), hierarchy, wino and fastdllm;
-eval_models.py picks the model implementation each one needs and handles --model-family dream
-(ours is LLaDA-only).
-
-Downloads openai/openai_humaneval from Hugging Face on first use.
-Candidate programs are executed with a timeout, as in the supplied evaluator.
-"""
 import argparse
 import hashlib
 import importlib
@@ -26,8 +17,7 @@ from transformers import AutoTokenizer
 
 # Baselines and the optional custom model loader are imported only when selected.
 from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
-from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options,
-                         load_model, resolve_loader, run_baseline, source_files)
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options, load_model, resolve_loader, run_baseline, source_files)
 
 
 MODES = ('low_confidence', 'ours')
@@ -41,7 +31,6 @@ def write_json(path, value):
 
 
 def extract_code(text):
-    """Return (code, source). Prefer the first fenced python block, then any fence, else raw text."""
     fenced = re.findall(r'```(?:python|py|Python)?[ \t]*\n(.*?)(?:```|$)', text, flags=re.S)
     if fenced:
         return fenced[0], 'fence'
@@ -49,7 +38,6 @@ def extract_code(text):
 
 
 def build_program(prompt, code, entry_point):
-    """Combine prompt and model code the way lm-eval/Fast-dLLM instruct HumanEval evals do."""
     code = code.rstrip()
     defines = re.search(rf'^\s*def\s+{re.escape(entry_point)}\s*\(', code, flags=re.M) is not None
     if defines:
@@ -68,7 +56,6 @@ def build_program(prompt, code, entry_point):
 
 
 def run_tests(program, test, entry_point, timeout, workdir):
-    """Execute program + test + check(entry_point) in a fresh interpreter. Returns (passed, status, stderr_tail)."""
     source = program + '\n\n' + test + '\n\n' + f'check({entry_point})\n'
     with tempfile.TemporaryDirectory(dir=workdir) as tmp:
         path = Path(tmp) / 'candidate.py'
@@ -152,8 +139,7 @@ def load_humaneval(args):
     if path.is_file():
         dataset = Dataset.from_file(str(path))
     else:
-        dataset = load_dataset(args.dataset, split=args.dataset_split,
-                               revision=args.dataset_revision, cache_dir=args.cache_dir)
+        dataset = load_dataset(args.dataset, split=args.dataset_split, revision=args.dataset_revision, cache_dir=args.cache_dir)
     required = {'task_id', 'prompt', 'test', 'entry_point'}
     if not required.issubset(dataset.column_names):
         raise ValueError(f'Dataset is missing columns: {sorted(required - set(dataset.column_names))}')
@@ -180,16 +166,14 @@ def get_variants(args):
         # Model selection must never be inferred from a baseline's options.
         cache = kwargs.pop('prefix_cache', None)
         if cache is not None and (decoder != 'ours' or cache is not True):
-            raise ValueError(f'{label}: prefix_cache is only supported as true for ours. '
-                             'Select a model implementation with --model-loader instead.')
+            raise ValueError(f'{label}: prefix_cache is only supported as true for ours. Select a model implementation with --model-loader instead.')
         if decoder == 'ours':
             kwargs.setdefault('n', args.n)
             kwargs.setdefault('confidence_threshold', args.confidence_threshold)
             kwargs.setdefault('remask_k', args.remask_k)
             kwargs.setdefault('remask_threshold', args.remask_threshold)
             kwargs.setdefault('force_confidence', args.force_confidence)
-            allowed = {'n', 'confidence_threshold', 'logits_eos_inf', 'eos_token_id',
-                       'remask_k', 'remask_threshold', 'force_confidence'}
+            allowed = {'n', 'confidence_threshold', 'logits_eos_inf', 'eos_token_id', 'remask_k', 'remask_threshold', 'force_confidence'}
             n, k = kwargs['n'], kwargs['remask_k']
             if isinstance(n, bool) or not isinstance(n, int) or n < 1:
                 raise ValueError(f'{label}: n must be a positive integer.')
@@ -405,8 +389,7 @@ def main():
                 text = tokenizer.decode(generated[:end], skip_special_tokens=True)
                 code, code_source = extract_code(text)
                 program, program_kind = build_program(sample['prompt'], code, sample['entry_point'])
-                passed, status, error_tail = run_tests(program, sample['test'], sample['entry_point'],
-                                                       args.exec_timeout, workdir)
+                passed, status, error_tail = run_tests(program, sample['test'], sample['entry_point'], args.exec_timeout, workdir)
                 counts = [count[0] for count in stats['unmasked_per_step']]
                 row = {
                     'test_index': index, 'task_id': sample['task_id'], 'mode': mode, 'seed': sample_seed,

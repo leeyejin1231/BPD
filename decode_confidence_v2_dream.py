@@ -1,43 +1,14 @@
-"""Confidence pivots on Dream-v0-Instruct-7B with Fast-dLLM's block/cache mechanics.
-
-Everything except the token-selection policy follows Fast-dLLM's Dream decoder
-(Fast-dLLM/v1/dream/model/generation_utils_block.py, prefix cache, dual_cache=False):
-  * the model is Fast-dLLM's modeling_dream.py (the stock HF Dream modeling does not
-    accept past_key_values); its KV cache is a list of (key, value) per layer with shape
-    [batch, sequence, hidden], the forward takes attention_mask="full" and recomputes
-    position ids from the cache length;
-  * every block starts with one full forward; Dream predicts position i from the logits
-    at i-1, so the logits are shifted right by one and block position 0 is committed from
-    that forward unconditionally (Fast-dLLM does this because the predictor row of
-    position 0 lives in the prefix, which the cache then freezes); the keys/values
-    before the block are kept as the prefix cache;
-  * every later forward sees x[:, block_start:] with the cached prefix and shifts the
-    suffix logits the same way (row 0 of the shift is a duplicate, but position 0 is
-    already committed, so it is never selected);
-  * tokens and confidences come from Fast-dLLM's sample_tokens on the bf16 logits
-    (softmax; temperature 0 -> argmax and its probability, otherwise logits/temperature
-    and a categorical sample with the sampled token's probability). Unlike Fast-dLLM,
-    the MASK logit is set to -inf before sampling (every forward, including the one that
-    commits position 0), and logits_eos_inf optionally does the same for EOS.
-The selection policy (interval centering, n-quota, step<=2 fast path, force_confidence)
-is decode_confidence_v2.py's, verbatim; step_idx counts the policy forwards, so the
-Fast-dLLM full forward that commits position 0 is not a policy step. force_confidence
-compares against the same bf16 softmax confidence that drives the policy.
-Batch size 1, unpadded. Token ids follow dream_adapter: mask 151666, eos/pad 151643.
-"""
 import math
 
 import torch
 
 
 def load_model(path, device='cuda'):
-    """Dream with Fast-dLLM's modeling (past_key_values support); same checkpoint weights."""
     from fastdllm_dream_decode import load_model as load
     return load(path, device)
 
 
 def prepare_prefix_cache(model):
-    """Fast-dLLM's Dream modeling caches natively; reject models that cannot."""
     if type(model).__name__ != 'DreamModel' or type(model).__module__ != 'fastdllm_dream_model':
         raise RuntimeError('ours on Dream needs Fast-dLLM\'s modeling_dream (decode_confidence_v2_dream.load_model); '
                            'the stock HF Dream model and DreamForwardAdapter do not accept past_key_values.')
@@ -45,7 +16,6 @@ def prepare_prefix_cache(model):
 
 
 def _sample_tokens():
-    """Fast-dLLM's sample_tokens (generation_utils_block.py), loaded the way the baseline loads it."""
     from fastdllm_dream_decode import _block_generation
     return _block_generation().sample_tokens
 
@@ -89,11 +59,6 @@ def generate(
     n_switch_threshold=128,
     force_confidence=None,
 ):
-    """Fill each MASK interval of a block with Fast-dLLM's Dream block/cache mechanics.
-
-    remask_k / remask_threshold / n_switch_threshold are accepted for interface parity
-    with decode_confidence_v2.py; remasking is not implemented on Dream.
-    """
     if prompt.ndim != 2 or prompt.shape[0] != 1 or prompt.shape[1] == 0:
         raise ValueError(
             'prefix-cache generation requires nonempty prompt shape '
@@ -162,8 +127,7 @@ def generate(
         # Policy steps on the cached prefix. Each step fills >= 1 token, so
         # block_length steps suffice for the block_length-1 remaining masks.
         for step_idx in range(block_length):
-            output = model(x[:, block_start:], attention_mask='full', position_ids=None,
-                           past_key_values=past_key_values, use_cache=True)
+            output = model(x[:, block_start:], attention_mask='full', position_ids=None, past_key_values=past_key_values, use_cache=True)
             # Fast-dLLM shift on the suffix logits (bf16, model dtype); keep the block rows.
             logits = _shift(output.logits)[0, :block_length]
             del output

@@ -1,21 +1,3 @@
-"""Resumable HF MATH-500 / MBPP / IFEval evaluation for LLaDA or Dream.
-
-Default: ours only; decode_confidence_v2.py must be beside this file.
-Optional baselines (low_confidence / random / random_pivot, hierarchy, wino, fastdllm) are
-imported only when requested; eval_models.py picks the model implementation each one needs
-and handles --model-family dream (ours is LLaDA-only).
-HF defaults: MATH-500 test; MBPP full/test; IFEval train.
-Local Arrow files remain supported via --dataset.
-
-Scoring preserves the supplied evaluator's protocol: normalized boxed-answer
-matching for MATH (not symbolic equivalence), visible-test MBPP, and the local
-ifeval_lib strict/loose instruction checkers. IFEval requires ifeval_lib/ beside
-this script, including its dependencies. MBPP runs generated Python in a
-subprocess with a timeout; that subprocess is not a security sandbox.
-
---shard k/n selects indices with index % n == k; use separate output directories.
---limit applies after sharding. Each example uses seed + its dataset index.
-"""
 import argparse
 import hashlib
 import inspect
@@ -34,11 +16,9 @@ import transformers
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 from decode_confidence_v2 import generate as generate_ours, prepare_prefix_cache
-from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options,
-                         load_model, resolve_loader, run_baseline, source_files)
+from eval_models import (BASELINES, DECODERS, MODEL_FAMILIES, TOKEN_IDS, baseline_options, load_model, resolve_loader, run_baseline, source_files)
 
 def last_boxed(text):
-    """Return the content of the last \\boxed{...} / \\fbox{...} with balanced braces, else None."""
     start = max(text.rfind('\\boxed'), text.rfind('\\fbox'))
     if start < 0:
         return None
@@ -110,7 +90,6 @@ def _fix_sqrt(string):
 
 
 def strip_string(string):
-    """Hendrycks MATH normalization (math_equivalence.strip_string) with a few extras."""
     string = str(string).replace('\n', '').replace('\\!', '').replace('\\\\', '\\')
     string = string.replace('tfrac', 'frac').replace('dfrac', 'frac')
     string = string.replace('\\left', '').replace('\\right', '')
@@ -188,8 +167,7 @@ def ifeval_score(sample, response):
     no_first = '\n'.join(lines[1:]).strip()
     no_last = '\n'.join(lines[:-1]).strip()
     no_both = '\n'.join(lines[1:-1]).strip()
-    for v in (no_first, no_last, no_both, stripped, no_first.replace('*', ''),
-              no_last.replace('*', ''), no_both.replace('*', '')):
+    for v in (no_first, no_last, no_both, stripped, no_first.replace('*', ''), no_last.replace('*', ''), no_both.replace('*', '')):
         variants.append(v)
     for index, instruction_id in enumerate(ids):
         instruction = instructions_registry.INSTRUCTION_DICT[instruction_id](instruction_id)

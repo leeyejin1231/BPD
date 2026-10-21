@@ -1,23 +1,3 @@
-"""WINO baseline (Hong et al., ICLR 2026), ported from WINO-DLLM/LLaDA/decoding.py::decoding_wino.
-
-WINO appends a block_length "shadow" copy of the current block to the sequence. Shadow
-positions share the block's position ids and attend to everything except their own
-counterpart, so their predictions score already-committed tokens (back-confidence).
-Each step accepts masked tokens with confidence > threshold (capped at
-clamp(0.7 * #masked, 5, 20); the argmax token if none qualify) and, when more than one
-token was accepted, revokes committed tokens whose back-confidence < threshold_back
-(capped at last_accept - 1 lowest). The block ends when it contains no [MASK].
-
-The shadow block needs a 4-D boolean attention mask and explicit position ids, which the
-Hugging Face LLaDA modeling does not accept, so load_model() builds the model with WINO's
-own modeling_llada.py (same weights, no KV cache). Batch size 1 only, as in the original.
-
-dream=True adapts the trick to Dream, which predicts position i from the hidden state at
-i-1 (its sampler shifts logits right by one). Shadow slot k therefore takes position id
-b0+k-1 and is forbidden to attend to block column b0+k, so its *unshifted* logits are the
-leave-one-out prediction of block token b0+k; the main sequence uses shifted logits as
-usual. Pass the raw Dream model (not DreamForwardAdapter), mask_id=151666.
-"""
 import sys
 from pathlib import Path
 
@@ -42,7 +22,6 @@ def load_model(path, device='cuda'):
 def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32, temperature=0.,
              mask_id=126336, threshold=0.6, threshold_back=0.9, return_stats=False, dream=False,
              **unused):
-    """Verbatim WINO decoding with per-step accounting; unused absorbs steps/cfg_scale."""
     if unused.get('cfg_scale', 0):
         raise NotImplementedError('CFG is not part of the WINO baseline.')
     if prompt.shape[0] != 1:
@@ -62,8 +41,7 @@ def generate(model, prompt, attention_mask=None, gen_length=128, block_length=32
         unmask_index_block = torch.full_like(mask_index_block, False)
         unmask_index_block[:, -block_length:] = ~mask_index_block[:, b0:b1]
         shadow_offset = -1 if dream else 0
-        position_ids = torch.cat([torch.arange(P + gen_length, device=device),
-                                  torch.arange(b0 + shadow_offset, b1 + shadow_offset, device=device)])
+        position_ids = torch.cat([torch.arange(P + gen_length, device=device), torch.arange(b0 + shadow_offset, b1 + shadow_offset, device=device)])
         if dream:
             position_ids = position_ids.unsqueeze(0)
         attn = torch.ones(1, 1, x_block.shape[1], x_block.shape[1], dtype=torch.bool, device=device)

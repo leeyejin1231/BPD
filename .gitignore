@@ -30,15 +30,11 @@ dInfer/
 old/
 WINO-DLLM/
 logs/
-ifeval_lib/
-configs/
 Fast-dLLM/
 DAPD/
-configs/
 bisection/
-legacy/
-
-
+ifeval_lib/
+configs/
 
 METHOD.md
 
