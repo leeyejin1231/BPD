@@ -65,9 +65,18 @@ The paper additionally reports an ablation, a comparison with bisection samplers
 
 **1. Install**
 
-=======
-## preparation
-### Fast-dLLM
+```bash
+pip install torch transformers datasets numpy accelerate
+pip install nltk langdetect immutabledict absl-py      # IFEval only
+```
+
+**2. Clone the baselines you need** (next to the evaluation scripts)
+
+```bash
+git clone https://github.com/NVlabs/Fast-dLLM.git       # Fast-dLLM; also required for BPD on Dream
+git clone https://github.com/Feng-Hong/WINO-DLLM.git    # WINO
+git clone https://github.com/quasar529/DAPD.git         # DAPD
+```
 
 Hierarchy-dLLM and the bisection samplers are self-contained. Models and datasets are downloaded from Hugging Face on first use.
 
@@ -228,9 +237,3 @@ Keys in `summary.json` behind the paper's metrics:
 | Score | `pass_at_1_percent` (HumanEval, MBPP), `accuracy_percent` (GSM8K, MATH-500), `prompt_strict_accuracy_percent` (IFEval) |
 | TPS | `final_tokens_per_second` |
 | Forward passes | `mean_forward_steps` |
-=======
-### Hierarchy-dLLM  
-```bash
-git clone https://github.com/inclusionAI/dInfer.git
-```
->>>>>>> main
